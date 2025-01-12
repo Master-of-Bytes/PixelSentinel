@@ -1,0 +1,4 @@
+.env
+pixelsentinel.db
+/__pycache__
+/pixelsentinel_env
