@@ -9,9 +9,9 @@ To run PixelSentinel you first need to install some third-party packages from sy
 
  ![image](https://github.com/user-attachments/assets/1645b7b5-6c86-4dac-a45f-080b8e732875)
 
-3. After you install the synocommunity package list go back to the Package Center on your NAS and look for and install the following:
+2. After you install the synocommunity package list go back to the Package Center on your NAS and look for and install the following:
    git, python 3.11
-4. Setup SSH on your NAS: https://kb.synology.com/en-nz/DSM/tutorial/How_to_login_to_DSM_with_root_permission_via_SSH_Telnet
+3. Setup SSH on your NAS: https://kb.synology.com/en-nz/DSM/tutorial/How_to_login_to_DSM_with_root_permission_via_SSH_Telnet
 Remember to change the SSH Port from 22.
 
 # Getting PixelSentinel and setup
