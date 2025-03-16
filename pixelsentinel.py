@@ -358,11 +358,11 @@ def sendalerts(_new_photo_count):
     # Create the message
     for album, member_list in members.items():
         photo_count = _new_photo_count[album]  # Get the photo count for the album
+        now = datetime.now()
+        senddt = now.strftime('%m/%d/%Y at %I:%M %p')
         for member_name, sms_number in member_list:
-            now = datetime.now()
-            currentdt = now.strftime('%m/%d/%Y at %I:%M %p')
             subject = 'PixelSentinel: New Photo(s) Added'
-            message = f'{member_name}, {photo_count} new photo(s) added to the album {album} on {currentdt}.'
+            message = f'{member_name}, {photo_count} new photo(s) added to the album {album} on {senddt}.'
             msg = MIMEMultipart()
             msg['From'] = os.getenv('SENDER_EMAIL')
             msg['To'] = sms_number
@@ -378,6 +378,7 @@ def sendalerts(_new_photo_count):
                     # Send the alert
                     smtp.send_message(msg)
                     print('Alert sent successfully.')
+                    time.sleep(300) # Wait for 5 minutes
             except Exception as e:
                 print(f'Error: {e}')
 
