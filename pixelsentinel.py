@@ -3,7 +3,7 @@ Program Name: PixelSentinel (c) Larry Zande
 
 Description: This program checks the 'photos' folder and sub folders
 of the synology photos app for uploaded photos and then using Gmail
-sends an SMS text message to end users alerting them.
+sends an email message to end users alerting them.
 On first run this program sets up the database, files and albums tables and then calls the sentinelmanage program to let the
 user set up the groups and members tables or add new albums.
 Later runs check and update the files and albums tables.
@@ -314,7 +314,7 @@ def get_album_groups(album_name):
 def get_member_info(album_name,group_name):
     try:
         member_info = db_execute('''
-        SELECT members.name AS member_name, members.sms_number
+        SELECT members.name AS member_name, members.email
         FROM albums
         JOIN groups ON albums.group_id = groups.group_id
         JOIN members ON groups.group_id = members.group_id
@@ -360,12 +360,12 @@ def sendalerts(_new_photo_count):
         photo_count = _new_photo_count[album]  # Get the photo count for the album
         now = datetime.now()
         senddt = now.strftime('%m/%d/%Y at %I:%M %p')
-        for member_name, sms_number in member_list:
+        for member_name, email in member_list:
             subject = 'PixelSentinel: New Photo(s) Added'
             message = f'{member_name}, {photo_count} new photo(s) added to the album {album} on {senddt}.'
             msg = MIMEMultipart()
             msg['From'] = os.getenv('SENDER_EMAIL')
-            msg['To'] = sms_number
+            msg['To'] = email
             msg['Subject'] = subject
             msg.attach(MIMEText(message, 'plain'))
 

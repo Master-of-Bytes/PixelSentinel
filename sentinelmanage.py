@@ -9,6 +9,7 @@ Date: 12/29/2024
 """
 import os
 import sqlite3
+import re
 
 try:
     import pandas as pd
@@ -165,38 +166,20 @@ def remove_group():
         except ValueError as e:
             print(f"Error while removing the group: {e}")
 
-# Check phone number
-def get_valid_phone_number():
-    while True:
-        user_input = input("Enter the member's number in a 10-digit format: ")
 
-        # Check if input is numeric and has exactly 10 characters
-        if user_input.isdigit() and len(user_input) == 10:
+# Check email
+def get_valid_email():
+    email_pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
+
+    while True:
+        user_input = input("Enter the member's email: ")
+
+        # Check if input is a valid email
+        if re.match(email_pattern, user_input):
             return user_input
         else:
-            print("Invalid input.")
+            print("Invalid input. Please enter a valid email address.")
 
-# Set the cell carrier
-def set_carrier(number):
-    print("\nCarriers")
-    print("----------")
-    print("1 - AT&T")
-    print("2 - Cricket Wireless")
-    print("3 - Verizon Wireless")
-
-    carrier = input(f"\nEnter a carrier to add to {number}: ").strip().upper()
-
-    if carrier == "1":
-        number = number + "@mms.att.net"
-        return number
-    elif carrier == "2":
-        number = number + "@mms.cricketwireless.net"
-        return number
-    elif carrier == "3":
-        number = number + "@vzwpix.com"
-        return number
-    else:
-        return set_carrier(number)
 
 # Add Group Member
 def add_group_member():
@@ -205,7 +188,7 @@ def add_group_member():
         CREATE TABLE IF NOT EXISTS members (
         member_id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
-        sms_number TEXT NOT NULL,
+        email TEXT NOT NULL,
         group_id INTEGER,
         FOREIGN KEY (group_id) REFERENCES groups (group_id) ON DELETE CASCADE
         );
@@ -240,15 +223,14 @@ def add_group_member():
 
             # Proceed with adding a member to the group
             member_name = input("Enter the member's name: ")
-            sms_number_only = get_valid_phone_number()
-            sms_number_carrier = set_carrier(sms_number_only)
-            print(f"Adding member {member_name} with SMS {sms_number_carrier} to group {group_id}...\n")
+            email = get_valid_email()
+            print(f"Adding member {member_name} with email {email} to group {group_id}...\n")
 
             # Insert the member into the members table
             db_execute('''
-                INSERT INTO members (name, sms_number, group_id)
+                INSERT INTO members (name, email, group_id)
                 VALUES (?, ?, ?)
-                ''', (member_name, sms_number_carrier, group_id))
+                ''', (member_name, email, group_id))
 
             print(f"Member {member_name} added successfully to group {group_id}.\n")
             break
@@ -613,9 +595,9 @@ def get_all_group_membership():
 
             # Get members of each group and convert to html
             group_members = db_execute('''
-                            SELECT name, sms_number from members WHERE group_id = ?
+                            SELECT name, email from members WHERE group_id = ?
                 ''', (group_id,), fetch=True)
-            headers = ["Member Name", "Member SMS Number"]
+            headers = ["Member Name", "Member Email"]
             df = pd.DataFrame(group_members, columns=headers)
             member_table += group_name + df.to_html(index=False, border=1, justify="center")
         return member_table
