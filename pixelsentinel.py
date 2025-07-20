@@ -377,8 +377,7 @@ def sendalerts(_new_photo_count):
 
                     # Send the alert
                     smtp.send_message(msg)
-                    print('Alert sent successfully.')
-                    time.sleep(300) # Wait for 5 minutes
+                    print(f'Alert sent successfully to {member_name}.')
             except Exception as e:
                 print(f'Error: {e}')
 
