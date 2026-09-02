@@ -7,9 +7,9 @@ print_error() {
   exit 1
 }
 
-# Check if python3.11 is available
-if ! command -v python3.11 &>/dev/null; then
-  print_error "python3.11 is not installed or not in PATH."
+# Check if python3.14 is available
+if ! command -v python3.14 &>/dev/null; then
+  print_error "python3.14 is not installed or not in PATH."
   exit 1
 fi
 
@@ -42,7 +42,7 @@ if [ -d "pixelsentinel_env" ]; then
   fi
 
   echo "Running sentinelmanage..."
-  python3.11 sentinelmanage.py
+  python3.14 sentinelmanage.py
 else
   print_error "Virtual environment not found. Please run setup.sh."
   exit 1

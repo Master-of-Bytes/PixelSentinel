@@ -2,7 +2,7 @@
 
 # Set the folder and virtual environment name
 FOLDER_NAME="pixelsentinel_env"
-PYTHON_EXECUTABLE="python3.11"
+PYTHON_EXECUTABLE="python3.14"
 
 # Check if the folder exists
 if [ ! -d "$FOLDER_NAME" ]; then
@@ -12,13 +12,13 @@ if [ ! -d "$FOLDER_NAME" ]; then
   # Navigate to the folder
   cd "$FOLDER_NAME" || exit
 
-  # Check if Python 3.11 is available
+  # Check if Python 3.14 is available
   if command -v "$PYTHON_EXECUTABLE" &>/dev/null; then
-    echo "Creating Python 3.11 virtual environment..."
+    echo "Creating Python 3.14 virtual environment..."
     $PYTHON_EXECUTABLE -m venv .
     echo "Virtual environment created successfully in '$FOLDER_NAME'."
   else
-    echo "Error: Python 3.11 is not installed or not found in PATH."
+    echo "Error: Python 3.14 is not installed or not found in PATH."
     exit 1
   fi
 else

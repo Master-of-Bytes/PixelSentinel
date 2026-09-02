@@ -2,8 +2,7 @@
 Program Name: PixelSentinel (c) Larry Zande
 
 Description: This program checks the 'photos' folder and sub folders
-of the synology photos app for uploaded photos and then using Gmail
-sends an email message to end users alerting them.
+of the synology photos app for uploaded photos and then alerts end users.
 On first run this program sets up the database, files and albums tables and then calls the sentinelmanage program to let the
 user set up the groups and members tables or add new albums.
 Later runs check and update the files and albums tables.
@@ -39,6 +38,7 @@ requirements_file = os.path.join(os.path.dirname(__file__), 'requirements.txt')
 
 def db_execute(query, params=(), fetch=False):
     connection = sqlite3.connect(db_file)
+    connection.execute("PRAGMA foreign_keys = ON")
     cursor = connection.cursor()
     try:
         cursor.execute(query, params)
@@ -66,6 +66,64 @@ def initialize_database():
         print(f"Database initialized at {db_file}.")
     except ValueError as e:
         print(f"Error initializing the database: {e}")
+
+# Initialize notification tables
+def initialize_notification_tables():
+    try:
+        db_execute('''
+            CREATE TABLE IF NOT EXISTS push_subscriptions (
+                subscription_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                member_id INTEGER NOT NULL,
+                endpoint TEXT NOT NULL UNIQUE,
+                p256dh TEXT NOT NULL,
+                auth TEXT NOT NULL,
+                platform TEXT,
+                user_agent TEXT,
+                device_label TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1
+                    CHECK (enabled IN (0, 1)),
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_success_at TEXT,
+                FOREIGN KEY (member_id)
+                    REFERENCES members(member_id)
+                    ON DELETE CASCADE
+            );
+        ''')
+
+        db_execute('''
+            CREATE INDEX IF NOT EXISTS
+            idx_push_subscriptions_member_id
+            ON push_subscriptions(member_id);
+        ''')
+
+        db_execute('''
+            CREATE TABLE IF NOT EXISTS member_invites (
+                invite_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                member_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
+                revoked_at TEXT,
+                FOREIGN KEY (member_id)
+                    REFERENCES members(member_id)
+                    ON DELETE CASCADE
+            );
+        ''')
+
+        db_execute('''
+            CREATE INDEX IF NOT EXISTS
+            idx_member_invites_member_id
+            ON member_invites(member_id);
+        ''')
+
+        print("Push notification tables initialized.")
+
+    except ValueError as e:
+        print(f"Error initializing notification tables: {e}")
 
 # Initialize albums based on files
 def initialize_albums():
@@ -391,6 +449,9 @@ def main():
 
     # Initialize database
     initialize_database()
+
+    # Initialize push notification tables
+    initialize_notification_tables()
 
     # Install requirements on first run
     install_requirements()

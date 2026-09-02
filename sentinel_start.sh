@@ -7,9 +7,9 @@ print_error() {
   exit 1
 }
 
-# Check if python3.11 is available
-if ! command -v python3.11 &>/dev/null; then
-  print_error "python3.11 is not installed or not in PATH."
+# Check if python3.14 is available
+if ! command -v python3.14 &>/dev/null; then
+  print_error "python3.14 is not installed or not in PATH."
 fi
 
 # Find the pixelsentinel folder, excluding directories starting with @ or #
@@ -40,7 +40,7 @@ if [ -d "pixelsentinel_env" ]; then
   fi
 
   echo "Running PixelSentinel..."
-  python3.11 pixelsentinel.py
+  python3.14 pixelsentinel.py
 else
   print_error "Virtual environment not found. Please run setup.sh."
 fi

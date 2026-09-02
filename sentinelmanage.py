@@ -22,6 +22,7 @@ db_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pixelsentine
 
 def db_execute(query, params=(), fetch=False):
     connection = sqlite3.connect(db_file)
+    connection.execute("PRAGMA foreign_keys = ON")
     cursor = connection.cursor()
     try:
         cursor.execute(query, params)
