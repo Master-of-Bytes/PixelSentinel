@@ -369,25 +369,37 @@ def get_album_groups(album_name):
         return
 
 # Get member info with album based on album/group name
-def get_member_info(album_name,group_name):
+def get_member_info(album_name, group_name):
     try:
-        member_info = db_execute('''
-        SELECT members.name AS member_name, members.email
-        FROM albums
-        JOIN groups ON albums.group_id = groups.group_id
-        JOIN members ON groups.group_id = members.group_id
-        WHERE albums.name = ? 
-        AND groups.name = ? 
-                ''',(album_name,group_name,), fetch=True)
+        member_info = db_execute(
+            '''
+            SELECT DISTINCT
+                members.member_id,
+                members.name AS member_name
+            FROM albums
+            JOIN groups
+                ON albums.group_id = groups.group_id
+            JOIN member_groups
+                ON groups.group_id = member_groups.group_id
+            JOIN members
+                ON member_groups.member_id = members.member_id
+            WHERE albums.name = ?
+              AND groups.name = ?
+            ORDER BY members.name
+            ''',
+            (album_name, group_name),
+            fetch=True
+        )
 
         if not member_info:
             print("No members found.\n")
-            return
-        else:
-            return member_info
+            return []
+
+        return member_info
+
     except ValueError as e:
         print(f"Error interacting with the database: {e}")
-        return
+        return []
 
 def sendalerts(_new_photo_count):
     members = {}  # Initialize members as a dictionary
@@ -504,7 +516,7 @@ def main():
         new_photo_count = get_album_photo_counts(files_new)
 
         # Send alerts
-        sendalerts(new_photo_count)
+       # sendalerts(new_photo_count)
 
         for file in files_new:
             print(f"New File: {file['path']} (Checksum: {file['checksum']})")

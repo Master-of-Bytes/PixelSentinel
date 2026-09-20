@@ -6,19 +6,43 @@ a helper program that lets you add/remove groups, group members, and albums to c
 who gets alert messages.
 
 Date: 12/29/2024
+V2: 9/13/2026 - Push alert system
 """
 import os
+import sys
 import sqlite3
-import re
+import secrets
+import hashlib
+import time
+
+from datetime import datetime, timedelta, timezone
 
 try:
     import pandas as pd
 except ModuleNotFoundError:
     print(f"The module pandas is not found. Please install with 'pip install pandas.'")
     exit(1)
+    
+try:
+    import qrcode
+except ModuleNotFoundError:
+    print(
+        "The module qrcode is not found. "
+        "Please install with 'pip install qrcode.'"
+    )
+    exit(1)
 
 # Configuration
 db_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pixelsentinel.db')
+
+ENROLLMENT_BASE_URL = (
+    "https://zandecloud.synology.me:8443/enroll"
+)
+
+INVITE_LIFETIME_HOURS = 24
+REMOVAL_LIFETIME_MINUTES = 15
+REMOVAL_PUSH_TTL_SECONDS = 900
+REMOVAL_ACK_WAIT_SECONDS = 15
 
 def db_execute(query, params=(), fetch=False):
     connection = sqlite3.connect(db_file)
@@ -36,6 +60,105 @@ def db_execute(query, params=(), fetch=False):
         cursor.close()
         connection.close()
 
+def initialize_membership_tables():
+    try:
+        db_execute('''
+            CREATE TABLE IF NOT EXISTS members (
+                member_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL
+            );
+        ''')
+
+        db_execute('''
+            CREATE TABLE IF NOT EXISTS member_groups (
+                member_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL,
+
+                PRIMARY KEY (member_id, group_id),
+
+                FOREIGN KEY (member_id)
+                    REFERENCES members(member_id)
+                    ON DELETE CASCADE,
+
+                FOREIGN KEY (group_id)
+                    REFERENCES groups(group_id)
+                    ON DELETE CASCADE
+            );
+        ''')
+
+    except ValueError as e:
+        print(f"Error initializing membership tables: {e}")
+
+def initialize_push_removal_tables():
+    """
+    Initialize database objects used for secure
+    remote push-subscription removal.
+    """
+
+    try:
+
+        db_execute(
+            '''
+            CREATE TABLE IF NOT EXISTS
+                subscription_removals
+            (
+                removal_id INTEGER
+                    PRIMARY KEY AUTOINCREMENT,
+
+                subscription_id INTEGER
+                    NOT NULL
+                    UNIQUE,
+
+                token_hash TEXT
+                    NOT NULL
+                    UNIQUE,
+
+                requested_at TEXT
+                    NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                expires_at TEXT
+                    NOT NULL,
+
+                attempt_count INTEGER
+                    NOT NULL
+                    DEFAULT 0,
+
+                last_attempt_at TEXT,
+
+                last_error TEXT,
+
+                FOREIGN KEY (
+                    subscription_id
+                )
+                    REFERENCES push_subscriptions(
+                        subscription_id
+                    )
+                    ON DELETE CASCADE
+            );
+            '''
+        )
+
+
+        db_execute(
+            '''
+            CREATE INDEX IF NOT EXISTS
+                idx_subscription_removals_subscription
+
+            ON subscription_removals (
+                subscription_id
+            );
+            '''
+        )
+
+
+    except ValueError as e:
+
+        print(
+            "Error initializing push removal "
+            f"tables: {e}"
+        )
+
 # Main menu
 def main_menu():
     while True:
@@ -52,6 +175,7 @@ def main_menu():
         print(' 5 - Add Album                   Adds a new album')
         print(' 6 - Update Album/Group Link     Update the link between an album and a group')
         print(' 7 - Duplicate Album             Duplicate an existing album to a new group')
+        print(' P - Push Management             Manage push enrollment and devices')
         print(' R - Create Report               Creates a system report')
         menu_choice = input('\nPress a key for item selection or press X to exit: ').strip().upper()
 
@@ -64,6 +188,7 @@ def main_menu():
             '5': add_album,
             '6': update_album,
             '7': duplicate_album,
+            'P': push_management_menu,
             'R': create_report
         }
 
@@ -154,11 +279,7 @@ def remove_group():
             if not valid_group:
                 print(f"Group ID {group_id_to_remove} does not exist. Please enter a valid Group ID.\n")
                 continue  # Prompt the user to try again
-            # Remove all members from the selected group
-            db_execute('''
-                            DELETE FROM members WHERE group_id = ?
-                            ''', (group_id_to_remove,))
-            print(f"All members removed from Group {group_id_to_remove} successfully.\n")
+
             # Attempt to remove the selected group
             db_execute('''
                 DELETE FROM groups WHERE group_id = ?
@@ -167,154 +288,387 @@ def remove_group():
         except ValueError as e:
             print(f"Error while removing the group: {e}")
 
-
-# Check email
-def get_valid_email():
-    email_pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
-
-    while True:
-        user_input = input("Enter the member's email: ")
-
-        # Check if input is a valid email
-        if re.match(email_pattern, user_input):
-            return user_input
-        else:
-            print("Invalid input. Please enter a valid email address.")
-
-
 # Add Group Member
 def add_group_member():
-    try:
-        db_execute('''
-        CREATE TABLE IF NOT EXISTS members (
-        member_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        email TEXT NOT NULL,
-        group_id INTEGER,
-        FOREIGN KEY (group_id) REFERENCES groups (group_id) ON DELETE CASCADE
-        );
-        ''')
-    except ValueError as e:
-        print(f"Error creating the table: {e}")
-        return
-
     while True:
-        existing_groups = get_groups_with_id_name()  # Display current groups
+        existing_groups = get_groups_with_id_name()
+
+        if not existing_groups:
+            print("No groups found.\n")
+            return
 
         print("\nGroup ID     Name")
-        print("--------     -----")
+        print("--------     ----")
+
         for group_id, name in existing_groups:
-            print(f"{group_id:<10} {name}")
+            print(f"{group_id:<12} {name}")
 
-        try:
-            group_id = input("\nEnter the Group ID to add a member to (or type 'X' to cancel): ")
+        group_id = input(
+            "\nEnter the Group ID to add a member to "
+            "(or type 'X' to cancel): "
+        ).strip()
 
-            if group_id.strip().upper() == 'X':
-                print("Add group member process canceled.\n")
-                break
+        if group_id.upper() == "X":
+            print("Add group member process canceled.\n")
+            return
 
-            # Check if the group ID exists in the database
-            valid_group = db_execute('''
-                SELECT group_id FROM groups WHERE group_id = ?
-                ''', (group_id,), fetch=True)
+        valid_group = db_execute(
+            '''
+            SELECT group_id
+            FROM groups
+            WHERE group_id = ?
+            ''',
+            (group_id,),
+            fetch=True
+        )
 
-            if not valid_group:
-                print(f"Group ID {group_id} does not exist. Please enter a valid Group ID.\n")
-                continue  # Prompt the user to try again
+        if not valid_group:
+            print(f"Group ID {group_id} does not exist.\n")
+            continue
 
-            # Proceed with adding a member to the group
-            member_name = input("Enter the member's name: ")
-            email = get_valid_email()
-            print(f"Adding member {member_name} with email {email} to group {group_id}...\n")
+        members = get_all_members()
 
-            # Insert the member into the members table
-            db_execute('''
-                INSERT INTO members (name, email, group_id)
-                VALUES (?, ?, ?)
-                ''', (member_name, email, group_id))
+        print("\nExisting Members:")
+        print("Member ID     Name")
+        print("---------     ----")
 
-            print(f"Member {member_name} added successfully to group {group_id}.\n")
-            break
-        except ValueError as e:
-            print(f"Error while adding the member to the group: {e}")
+        for member_id, name in members:
+            print(f"{member_id:<13} {name}")
+
+        print("\nN - Create a new member")
+
+        choice = input(
+            "\nEnter Member ID, N for new member, "
+            "or X to cancel: "
+        ).strip()
+
+        if choice.upper() == "X":
+            return
+
+        if choice.upper() == "N":
+            member_name = input(
+                "Enter the new member's name: "
+            ).strip()
+
+            if not member_name:
+                print("Member name cannot be empty.\n")
+                continue
+
+            # Prevent accidental duplicate people.
+            duplicate = db_execute(
+                '''
+                SELECT member_id, name
+                FROM members
+                WHERE LOWER(name) = LOWER(?)
+                ''',
+                (member_name,),
+                fetch=True
+            )
+
+            if duplicate:
+                print(
+                    f"\nA member named '{member_name}' already exists."
+                )
+                print(
+                    "Use the existing Member ID instead of "
+                    "creating another record.\n"
+                )
+                continue
+
+            db_execute(
+                '''
+                INSERT INTO members (name)
+                VALUES (?)
+                ''',
+                (member_name,)
+            )
+
+            result = db_execute(
+                '''
+                SELECT member_id
+                FROM members
+                WHERE name = ?
+                ORDER BY member_id DESC
+                LIMIT 1
+                ''',
+                (member_name,),
+                fetch=True
+            )
+
+            member_id = result[0][0]
+
+        else:
+            if not choice.isdigit():
+                print("Invalid Member ID.\n")
+                continue
+
+            member_id = int(choice)
+
+            valid_member = db_execute(
+                '''
+                SELECT member_id, name
+                FROM members
+                WHERE member_id = ?
+                ''',
+                (member_id,),
+                fetch=True
+            )
+
+            if not valid_member:
+                print(f"Member ID {member_id} does not exist.\n")
+                continue
+
+            member_name = valid_member[0][1]
+
+        existing_link = db_execute(
+            '''
+            SELECT member_id
+            FROM member_groups
+            WHERE member_id = ?
+              AND group_id = ?
+            ''',
+            (member_id, group_id),
+            fetch=True
+        )
+
+        if existing_link:
+            print(
+                f"\n{member_name} is already a member "
+                f"of Group {group_id}.\n"
+            )
+            return
+
+        db_execute(
+            '''
+            INSERT INTO member_groups (
+                member_id,
+                group_id
+            )
+            VALUES (?, ?)
+            ''',
+            (member_id, group_id)
+        )
+
+        print(
+            f"\n{member_name} successfully added "
+            f"to Group {group_id}.\n"
+        )
+
+        return
 
 # Get Current members of a selected group
 def get_members(group_id):
     try:
-        # List all members with IDs
-        existing_members = db_execute('''
-                    SELECT member_id, name FROM members WHERE group_id = ?
-                    ''', (group_id,), fetch=True)
+        existing_members = db_execute(
+            '''
+            SELECT
+                members.member_id,
+                members.name
+            FROM members
+            JOIN member_groups
+                ON members.member_id = member_groups.member_id
+            WHERE member_groups.group_id = ?
+            ORDER BY members.name
+            ''',
+            (group_id,),
+            fetch=True
+        )
 
-        if not existing_members:
-            print("No members found in group.\n")
-            return
-        else:
-            return existing_members
+        return existing_members or []
+
     except ValueError as e:
         print(f"Error interacting with the database: {e}")
-        return
+        return []
+
+# Get all members
+def get_all_members():
+    try:
+        members = db_execute(
+            '''
+            SELECT member_id, name
+            FROM members
+            ORDER BY name
+            ''',
+            fetch=True
+        )
+
+        return members or []
+
+    except ValueError as e:
+        print(f"Error retrieving members: {e}")
+        return []
+
+# Push Notification Management Menu
+def push_management_menu():
+    while True:
+
+        print()
+        print('*' * 32)
+        print('***** Push Management Menu *****')
+        print('*' * 32)
+
+        print(
+            '\n Key  Menu Option:                 '
+            'Description:'
+        )
+
+        print(
+            '---  ------------                  '
+            '------------'
+        )
+
+        print(
+            ' 1 - Create Enrollment Invite     '
+            'Creates a private device invite'
+        )
+
+        print(
+            ' 2 - Manage Pending Invites       '
+            'Lists and revokes unused invites'
+        )
+
+        print(
+            ' 3 - Registered Devices           '
+            'Lists registered push devices'
+        )
+
+        print(
+            ' 4 - Enable/Disable Device        '
+            'Changes device notification status'
+        )
+
+        print(
+            ' 5 - Remove Device                '
+            'Remotely removes a push device'
+        )
+
+        print(
+            ' X - Return to Main Menu          '
+            'Returns to the main menu'
+        )
+
+        menu_choice = input(
+            '\nPress a key for item selection: '
+        ).strip().upper()
+
+        if menu_choice == '1':
+
+            create_enrollment_invite()
+
+        elif menu_choice == '2':
+
+            manage_pending_invites()
+
+        elif menu_choice == '3':
+
+            registered_devices()
+
+        elif menu_choice == '4':
+
+            manage_device_status()
+
+        elif menu_choice == '5':
+
+            remove_registered_device()
+
+        elif menu_choice == 'X':
+
+            return
 
 # Remove Group Member
 def remove_group_member():
     while True:
-        existing_groups = get_groups_with_id_name()  # Display current groups
+        existing_groups = get_groups_with_id_name()
+
+        if not existing_groups:
+            print("No groups found.\n")
+            return
 
         print("\nGroup ID     Name")
-        print("--------     -----")
+        print("--------     ----")
+
         for group_id, name in existing_groups:
-            print(f"{group_id:<10} {name}")
+            print(f"{group_id:<12} {name}")
 
-        # Allow the user to remove a group member
-        try:
-            member_group = input("\nEnter the Group ID to remove a member from (or type 'X' to cancel): ")
+        member_group = input(
+            "\nEnter the Group ID to remove a member from "
+            "(or type 'X' to cancel): "
+        ).strip()
 
-            if member_group.strip().upper() == 'X':
-                print("Member removal process canceled.\n")
-                return
+        if member_group.upper() == "X":
+            return
 
-            # Check if the group ID exists in the database
-            valid_group = db_execute('''
-                SELECT group_id FROM groups WHERE group_id = ?
-                ''', (member_group,), fetch=True)
+        valid_group = db_execute(
+            '''
+            SELECT group_id
+            FROM groups
+            WHERE group_id = ?
+            ''',
+            (member_group,),
+            fetch=True
+        )
 
-            if not valid_group:
-                print(f"Group ID {member_group} does not exist. Please enter a valid Group ID.\n")
-                continue  # Prompt the user to try again
+        if not valid_group:
+            print(f"Group ID {member_group} does not exist.\n")
+            continue
 
-            # Display current members of the selected group
-            existing_members = get_members(member_group)
-            print("\nMember ID     Name")
-            print("--------     -----")
-            for member_id, name in existing_members:
-                print(f"{member_id:<10} {name}")
+        existing_members = get_members(member_group)
 
-            member_id = input("\nEnter the Member ID of the member to remove (or type 'X' to cancel): ")
+        if not existing_members:
+            print("\nNo members are assigned to this group.\n")
+            return
 
-            if member_id.strip().upper() == 'X':
-                print("Member removal process canceled.\n")
-                return
+        print("\nMember ID     Name")
+        print("---------     ----")
 
-            # Check if the member ID exists in the database
-            valid_member = db_execute('''
-                SELECT member_id FROM members WHERE member_id = ? AND group_id = ?
-                ''', (member_id, member_group), fetch=True)
+        for member_id, name in existing_members:
+            print(f"{member_id:<13} {name}")
 
-            if not valid_member:
-                print(f"Member ID {member_id} does not exist in Group ID {member_group}.\n")
-                continue  # Prompt the user to try again
+        member_id = input(
+            "\nEnter Member ID to remove from this group "
+            "(or X to cancel): "
+        ).strip()
 
-            # Remove the user from the selected group
-            db_execute('''
-                DELETE FROM members WHERE member_id = ? AND group_id = ?
-                ''', (member_id, member_group))
-            print(f"Member with ID {member_id} removed successfully from Group ID {member_group}.\n")
-            break  # Exit the loop after successful removal
+        if member_id.upper() == "X":
+            return
 
-        except ValueError as e:
-            print(f"Error while removing member from group: {e}")
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}")
+        valid_member = db_execute(
+            '''
+            SELECT members.name
+            FROM member_groups
+            JOIN members
+                ON member_groups.member_id = members.member_id
+            WHERE member_groups.member_id = ?
+              AND member_groups.group_id = ?
+            ''',
+            (member_id, member_group),
+            fetch=True
+        )
+
+        if not valid_member:
+            print(
+                f"Member ID {member_id} is not in "
+                f"Group {member_group}.\n"
+            )
+            continue
+
+        member_name = valid_member[0][0]
+
+        db_execute(
+            '''
+            DELETE FROM member_groups
+            WHERE member_id = ?
+              AND group_id = ?
+            ''',
+            (member_id, member_group)
+        )
+
+        print(
+            f"\n{member_name} removed from "
+            f"Group {member_group}.\n"
+        )
+
+        return
 
 # Add a new album
 def add_album():
@@ -595,10 +949,20 @@ def get_all_group_membership():
             group_name = f'<h1 style="text-align:center;">{group_name[0][0]}</h1>'
 
             # Get members of each group and convert to html
-            group_members = db_execute('''
-                            SELECT name, email from members WHERE group_id = ?
-                ''', (group_id,), fetch=True)
-            headers = ["Member Name", "Member Email"]
+            group_members = db_execute(
+                '''
+                SELECT members.name
+                FROM members
+                JOIN member_groups
+                    ON members.member_id = member_groups.member_id
+                WHERE member_groups.group_id = ?
+                ORDER BY members.name
+                ''',
+                (group_id,),
+                fetch=True
+            )
+
+            headers = ["Member Name"]
             df = pd.DataFrame(group_members, columns=headers)
             member_table += group_name + df.to_html(index=False, border=1, justify="center")
         return member_table
@@ -689,7 +1053,2027 @@ def create_report():
     report_path = os.path.join(os.path.dirname(os.path.abspath(__file__)))
     print(f'System report saved to {report_path} with file name PixelSentinelReport.html')
 
+def clear_sensitive_terminal():
+    """
+    Best-effort clearing of sensitive enrollment
+    information from the terminal.
+
+    ANSI-capable terminals will also be asked to clear
+    their scrollback buffer.
+    """
+
+    if os.name == "nt":
+
+        os.system("cls")
+
+    else:
+
+        sys.stdout.write(
+            "\033[3J"
+            "\033[2J"
+            "\033[H"
+        )
+
+        sys.stdout.flush()
+        
+def display_enrollment_qr(
+    member_name,
+    enrollment_url,
+    expires_at
+):
+    """
+    Display a private PixelSentinel enrollment QR code
+    directly in the terminal.
+
+    The QR code is generated in memory and written only
+    to stdout. No PNG, JPEG, SVG, or temporary image
+    file is created.
+    """
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=
+            qrcode.constants.ERROR_CORRECT_M,
+        box_size=1,
+        border=2
+    )
+
+    qr.add_data(
+        enrollment_url
+    )
+
+    qr.make(
+        fit=True
+    )
+
+    clear_sensitive_terminal()
+
+    print()
+    print('=' * 60)
+    print('PIXELSENTINEL PRIVATE ENROLLMENT')
+    print('=' * 60)
+
+    print()
+    print(
+        f"Member: {member_name}"
+    )
+
+    print(
+        f"Invite expires: {expires_at}"
+    )
+
+    print()
+    print(
+        "Scan this QR code with the device "
+        "being enrolled:"
+    )
+    print()
+
+
+    try:
+
+        qr.print_ascii(
+            out=sys.stdout,
+            tty=True
+        )
+
+    except OSError:
+
+        # Fallback for terminals that do not identify
+        # themselves as a TTY.
+        qr.print_ascii(
+            out=sys.stdout,
+            invert=True
+        )
+
+
+    print()
+    print(
+        "This QR code contains a private "
+        "PixelSentinel enrollment credential."
+    )
+
+    print(
+        "Do not photograph, screenshot, or share it."
+    )
+
+
+    while True:
+
+        choice = input(
+            "\nPress U to display the private URL, "
+            "or press Enter when finished: "
+        ).strip().upper()
+
+
+        if choice == "":
+
+            break
+
+
+        if choice == "U":
+
+            print()
+            print("Private enrollment URL:")
+            print()
+            print(enrollment_url)
+            print()
+
+            input(
+                "Press Enter when finished..."
+            )
+
+            break
+
+
+        print(
+            "Invalid selection. "
+            "Press U or Enter."
+        )
+
+
+    clear_sensitive_terminal()
+
+def create_enrollment_invite():
+    """
+    Create a single-use PixelSentinel enrollment invite.
+
+    The raw token exists only long enough to display the
+    enrollment QR/URL.
+
+    Only the SHA-256 token hash is stored in SQLite.
+    """
+
+    members = get_all_members()
+
+    if not members:
+
+        print(
+            "\nNo members are available.\n"
+        )
+
+        return
+
+
+    while True:
+
+        print()
+        print("Existing Members:")
+        print()
+        print("Member ID     Name")
+        print("---------     ----")
+
+        for member_id, name in members:
+
+            print(
+                f"{member_id:<13} {name}"
+            )
+
+
+        choice = input(
+            "\nEnter the Member ID to create "
+            "an enrollment invite for "
+            "(or X to cancel): "
+        ).strip()
+
+
+        if choice.upper() == "X":
+
+            print(
+                "\nEnrollment invite creation "
+                "canceled.\n"
+            )
+
+            return
+
+
+        if not choice.isdigit():
+
+            print(
+                "\nInvalid Member ID.\n"
+            )
+
+            continue
+
+
+        member_id = int(
+            choice
+        )
+
+
+        member = db_execute(
+            '''
+            SELECT
+                member_id,
+                name
+            FROM members
+            WHERE member_id = ?
+            ''',
+            (member_id,),
+            fetch=True
+        )
+
+
+        if not member:
+
+            print(
+                f"\nMember ID {member_id} "
+                "does not exist.\n"
+            )
+
+            continue
+
+
+        member_name = member[0][1]
+
+        break
+
+
+    # Generate the private enrollment credential.
+    token = secrets.token_urlsafe(
+        32
+    )
+
+
+    # Store only a one-way SHA-256 representation.
+    token_hash = hashlib.sha256(
+        token.encode("utf-8")
+    ).hexdigest()
+
+
+    expires_at = (
+        datetime.now(
+            timezone.utc
+        )
+        + timedelta(
+            hours=INVITE_LIFETIME_HOURS
+        )
+    ).isoformat()
+
+
+    connection = None
+    invite_id = None
+
+
+    try:
+
+        connection = sqlite3.connect(
+            db_file,
+            timeout=5
+        )
+
+        connection.execute(
+            "PRAGMA foreign_keys = ON"
+        )
+
+        connection.execute(
+            "PRAGMA busy_timeout = 5000"
+        )
+
+
+        cursor = connection.execute(
+            '''
+            INSERT INTO member_invites (
+                member_id,
+                token_hash,
+                expires_at
+            )
+            VALUES (?, ?, ?)
+            ''',
+            (
+                member_id,
+                token_hash,
+                expires_at
+            )
+        )
+
+
+        invite_id = cursor.lastrowid
+
+        connection.commit()
+
+
+    except sqlite3.Error:
+
+        if connection is not None:
+
+            connection.rollback()
+
+
+        print()
+        print(
+            "Unable to create the enrollment invite."
+        )
+        print()
+
+        return
+
+
+    finally:
+
+        if connection is not None:
+
+            connection.close()
+
+
+    enrollment_url = (
+        f"{ENROLLMENT_BASE_URL}/{token}"
+    )
+
+
+    try:
+
+        display_enrollment_qr(
+            member_name,
+            enrollment_url,
+            expires_at
+        )
+
+
+    except KeyboardInterrupt:
+
+        clear_sensitive_terminal()
+
+        print()
+        print(
+            "Enrollment display closed."
+        )
+
+        print(
+            "The invitation remains active until "
+            "it is used, expires, or is revoked."
+        )
+        print()
+
+        return
+
+
+    except Exception:
+
+        clear_sensitive_terminal()
+
+        # If PixelSentinel could not display the
+        # credential at all, revoke the newly-created
+        # invitation because the raw token cannot be
+        # recovered later.
+
+        try:
+
+            db_execute(
+                '''
+                UPDATE member_invites
+                SET revoked_at = CURRENT_TIMESTAMP
+                WHERE invite_id = ?
+                  AND used_at IS NULL
+                  AND revoked_at IS NULL
+                ''',
+                (invite_id,)
+            )
+
+        except ValueError:
+
+            pass
+
+
+        print()
+        print(
+            "The enrollment credential could not "
+            "be displayed."
+        )
+
+        print(
+            "The new invitation was revoked."
+        )
+        print()
+
+        return
+
+
+    finally:
+
+        # Python cannot guarantee secure memory wiping
+        # of immutable string objects, but PixelSentinel
+        # deliberately stops retaining references to
+        # the raw credential after display.
+        token = None
+        enrollment_url = None
+
+
+    print()
+    print(
+        f"Enrollment invite {invite_id} "
+        f"created for {member_name}."
+    )
+
+    print(
+        "The private credential will not "
+        "be displayed again."
+    )
+    print()
+
+def get_pending_invites():
+    """
+    Return enrollment invitations that have not been
+    successfully consumed.
+
+    Raw tokens, token hashes, enrollment URLs, and QR
+    data are deliberately excluded.
+    """
+
+    try:
+
+        invites = db_execute(
+            '''
+            SELECT
+                member_invites.invite_id,
+                member_invites.member_id,
+                members.name,
+                member_invites.created_at,
+                member_invites.expires_at,
+                member_invites.revoked_at,
+
+                CASE
+
+                    WHEN member_invites.revoked_at
+                         IS NOT NULL
+                    THEN 'REVOKED'
+
+                    WHEN datetime(
+                        member_invites.expires_at
+                    ) <= CURRENT_TIMESTAMP
+                    THEN 'EXPIRED'
+
+                    ELSE 'ACTIVE'
+
+                END AS invite_status
+
+            FROM member_invites
+
+            JOIN members
+                ON member_invites.member_id =
+                   members.member_id
+
+            WHERE member_invites.used_at IS NULL
+
+            ORDER BY
+                member_invites.created_at DESC,
+                member_invites.invite_id DESC
+            ''',
+            fetch=True
+        )
+
+        return invites or []
+
+    except ValueError as e:
+
+        print(
+            f"Error retrieving pending invites: {e}"
+        )
+
+        return []
+
+def display_pending_invites(
+    invites
+):
+    """
+    Display non-consumed enrollment invitations.
+    """
+
+    print()
+    print("Pending Enrollment Invites:")
+    print()
+
+    print(
+        f"{'Invite ID':<11}"
+        f"{'Member ID':<11}"
+        f"{'Member':<20}"
+        f"{'Status':<10}"
+        f"{'Created':<22}"
+        f"{'Expires':<32}"
+    )
+
+    print(
+        f"{'-' * 9:<11}"
+        f"{'-' * 9:<11}"
+        f"{'-' * 18:<20}"
+        f"{'-' * 8:<10}"
+        f"{'-' * 20:<22}"
+        f"{'-' * 30:<32}"
+    )
+
+    for (
+        invite_id,
+        member_id,
+        member_name,
+        created_at,
+        expires_at,
+        revoked_at,
+        invite_status
+    ) in invites:
+
+        print(
+            f"{invite_id:<11}"
+            f"{member_id:<11}"
+            f"{member_name:<20}"
+            f"{invite_status:<10}"
+            f"{created_at:<22}"
+            f"{expires_at:<32}"
+        )
+
+def revoke_enrollment_invite(
+    invite_id
+):
+    """
+    Revoke an enrollment invite only if it has not
+    already been used or revoked.
+
+    Returns True only when a row was actually changed.
+    """
+
+    connection = None
+
+    try:
+
+        connection = sqlite3.connect(
+            db_file,
+            timeout=5
+        )
+
+        connection.execute(
+            "PRAGMA foreign_keys = ON"
+        )
+
+        connection.execute(
+            "PRAGMA busy_timeout = 5000"
+        )
+
+        cursor = connection.execute(
+            '''
+            UPDATE member_invites
+
+            SET revoked_at =
+                CURRENT_TIMESTAMP
+
+            WHERE invite_id = ?
+              AND used_at IS NULL
+              AND revoked_at IS NULL
+
+            RETURNING invite_id
+            ''',
+            (invite_id,)
+        )
+
+        result = cursor.fetchone()
+
+        if result is None:
+
+            connection.rollback()
+
+            return False
+
+        connection.commit()
+
+        return True
+
+    except sqlite3.Error:
+
+        if connection is not None:
+
+            connection.rollback()
+
+        print(
+            "\nUnable to revoke the enrollment invite.\n"
+        )
+
+        return False
+
+    finally:
+
+        if connection is not None:
+
+            connection.close()
+
+def manage_pending_invites():
+    """
+    List non-consumed enrollment invites and allow an
+    administrator to revoke an unused invitation.
+
+    Raw tokens cannot be recovered or redisplayed.
+    """
+
+    while True:
+
+        invites = get_pending_invites()
+
+        if not invites:
+
+            print(
+                "\nNo pending enrollment invites found.\n"
+            )
+
+            return
+
+
+        display_pending_invites(
+            invites
+        )
+
+
+        print()
+        print(
+            "R - Revoke an enrollment invite"
+        )
+
+        print(
+            "X - Return to Push Management"
+        )
+
+
+        choice = input(
+            "\nSelect an option: "
+        ).strip().upper()
+
+
+        if choice == "X":
+
+            return
+
+
+        if choice != "R":
+
+            print(
+                "\nInvalid selection.\n"
+            )
+
+            continue
+
+
+        invite_choice = input(
+            "\nEnter the Invite ID to revoke "
+            "(or X to cancel): "
+        ).strip()
+
+
+        if invite_choice.upper() == "X":
+
+            continue
+
+
+        if not invite_choice.isdigit():
+
+            print(
+                "\nInvalid Invite ID.\n"
+            )
+
+            continue
+
+
+        invite_id = int(
+            invite_choice
+        )
+
+
+        # Look only among pending invites.
+        selected_invite = None
+
+        for invite in invites:
+
+            if invite[0] == invite_id:
+
+                selected_invite = invite
+
+                break
+
+
+        if selected_invite is None:
+
+            print(
+                "\nThat Invite ID is not a "
+                "pending enrollment invite.\n"
+            )
+
+            continue
+
+
+        (
+            invite_id,
+            member_id,
+            member_name,
+            created_at,
+            expires_at,
+            revoked_at,
+            invite_status
+        ) = selected_invite
+
+
+        if invite_status == "REVOKED":
+
+            print(
+                "\nThat enrollment invite is "
+                "already revoked.\n"
+            )
+
+            continue
+
+
+        if invite_status == "EXPIRED":
+
+            print()
+            print(
+                "That enrollment invite has "
+                "already expired."
+            )
+
+            print(
+                "It can no longer be used for "
+                "device enrollment."
+            )
+            print()
+
+            continue
+
+
+        print()
+        print(
+            "Enrollment Invite:"
+        )
+
+        print(
+            f"  Invite ID: {invite_id}"
+        )
+
+        print(
+            f"  Member:    {member_name}"
+        )
+
+        print(
+            f"  Status:    {invite_status}"
+        )
+
+        print(
+            f"  Expires:   {expires_at}"
+        )
+
+        print()
+
+        confirm = input(
+            "Revoke this enrollment invite? "
+            "(Y/N): "
+        ).strip().upper()
+
+
+        if confirm != "Y":
+
+            print(
+                "\nInvite was not revoked.\n"
+            )
+
+            continue
+
+
+        revoked = revoke_enrollment_invite(
+            invite_id
+        )
+
+
+        if revoked:
+
+            print()
+            print(
+                f"Enrollment invite {invite_id} "
+                f"for {member_name} was revoked."
+            )
+
+            print(
+                "It can no longer be used for "
+                "device enrollment."
+            )
+            print()
+
+        else:
+
+            print()
+            print(
+                "The enrollment invite could not "
+                "be revoked."
+            )
+
+            print(
+                "It may already have been used or "
+                "changed by another process."
+            )
+            print()
+
+def get_registered_devices():
+    """
+    Return registered PixelSentinel push devices.
+    """
+
+    try:
+
+        devices = db_execute(
+            '''
+            SELECT
+                push_subscriptions.subscription_id,
+                members.member_id,
+                members.name,
+                push_subscriptions.device_label,
+                push_subscriptions.platform,
+                push_subscriptions.enabled,
+                push_subscriptions.failure_count,
+                push_subscriptions.created_at,
+                push_subscriptions.last_success_at
+
+            FROM push_subscriptions
+
+            JOIN members
+                ON push_subscriptions.member_id =
+                   members.member_id
+
+            ORDER BY
+                members.name COLLATE NOCASE,
+                push_subscriptions.subscription_id
+            ''',
+            fetch=True
+        )
+
+        return devices or []
+
+    except ValueError as e:
+
+        print(
+            f"Error retrieving registered devices: {e}"
+        )
+
+        return []
+
+def display_registered_devices(devices):
+    """
+    Display registered PixelSentinel push devices.
+    """
+
+    print()
+    print("Registered PixelSentinel Devices:")
+    print()
+
+    print(
+        f"{'Sub ID':<8}"
+        f"{'Member ID':<11}"
+        f"{'Member':<18}"
+        f"{'Device':<20}"
+        f"{'Platform':<11}"
+        f"{'Enabled':<10}"
+        f"{'Failures':<10}"
+        f"{'Created':<21}"
+        f"{'Last Success':<21}"
+    )
+
+    print(
+        f"{'-' * 6:<8}"
+        f"{'-' * 9:<11}"
+        f"{'-' * 16:<18}"
+        f"{'-' * 18:<20}"
+        f"{'-' * 9:<11}"
+        f"{'-' * 8:<10}"
+        f"{'-' * 8:<10}"
+        f"{'-' * 19:<21}"
+        f"{'-' * 19:<21}"
+    )
+
+    for (
+        subscription_id,
+        member_id,
+        member_name,
+        device_label,
+        platform,
+        enabled,
+        failure_count,
+        created_at,
+        last_success_at
+    ) in devices:
+
+        enabled_text = (
+            "Yes"
+            if enabled
+            else "No"
+        )
+
+        device_text = (
+            device_label
+            or "Unknown"
+        )
+
+        platform_text = (
+            platform
+            or "other"
+        )
+
+        created_text = (
+            created_at
+            or "-"
+        )
+
+        success_text = (
+            last_success_at
+            or "-"
+        )
+
+        print(
+            f"{subscription_id:<8}"
+            f"{member_id:<11}"
+            f"{member_name:<18}"
+            f"{device_text:<20}"
+            f"{platform_text:<11}"
+            f"{enabled_text:<10}"
+            f"{failure_count:<10}"
+            f"{created_text:<21}"
+            f"{success_text:<21}"
+        )
+
+def registered_devices():
+    """
+    Read-only registered device view.
+    """
+
+    devices = get_registered_devices()
+
+    if not devices:
+
+        print(
+            "\nNo registered PixelSentinel "
+            "devices found.\n"
+        )
+
+        input(
+            "Press Enter to return to "
+            "Push Management..."
+        )
+
+        return
+
+
+    display_registered_devices(devices)
+
+    print()
+    print("This is a read-only device view.")
+
+    input(
+        "\nPress Enter to return to "
+        "Push Management..."
+    )
+
+def get_registered_device(
+    subscription_id
+):
+    """
+    Return one registered device
+    """
+
+    try:
+
+        result = db_execute(
+            '''
+            SELECT
+                push_subscriptions.subscription_id,
+                push_subscriptions.member_id,
+                members.name,
+                push_subscriptions.device_label,
+                push_subscriptions.platform,
+                push_subscriptions.enabled,
+                push_subscriptions.failure_count,
+                push_subscriptions.created_at,
+                push_subscriptions.last_success_at
+
+            FROM push_subscriptions
+
+            JOIN members
+                ON push_subscriptions.member_id =
+                   members.member_id
+
+            WHERE push_subscriptions.subscription_id = ?
+            ''',
+            (subscription_id,),
+            fetch=True
+        )
+
+        if not result:
+
+            return None
+
+        return result[0]
+
+    except ValueError as e:
+
+        print(
+            f"Error retrieving registered device: {e}"
+        )
+
+        return None
+def set_registered_device_enabled(
+    subscription_id,
+    enabled
+):
+    """
+    Enable or disable a registered push subscription.
+
+    The subscription itself is preserved.
+
+    Returns True only when the requested subscription
+    exists and the update succeeds.
+    """
+
+    if enabled not in (
+        True,
+        False
+    ):
+
+        return False
+
+
+    connection = None
+
+    try:
+
+        connection = sqlite3.connect(
+            db_file,
+            timeout=5
+        )
+
+        connection.execute(
+            "PRAGMA foreign_keys = ON"
+        )
+
+        connection.execute(
+            "PRAGMA busy_timeout = 5000"
+        )
+
+
+        cursor = connection.execute(
+            '''
+            UPDATE push_subscriptions
+
+            SET
+                enabled = ?,
+                updated_at = CURRENT_TIMESTAMP
+
+            WHERE subscription_id = ?
+
+            RETURNING subscription_id
+            ''',
+            (
+                1 if enabled else 0,
+                subscription_id
+            )
+        )
+
+
+        result = cursor.fetchone()
+
+
+        if result is None:
+
+            connection.rollback()
+
+            return False
+
+
+        connection.commit()
+
+        return True
+
+
+    except sqlite3.Error:
+
+        if connection is not None:
+
+            connection.rollback()
+
+
+        print()
+        print(
+            "Unable to update the registered device."
+        )
+        print()
+
+        return False
+
+
+    finally:
+
+        if connection is not None:
+
+            connection.close()
+            
+def manage_device_status():
+    """
+    Enable or disable an existing PixelSentinel
+    push device without deleting its subscription.
+    """
+
+    while True:
+
+        devices = get_registered_devices()
+
+
+        if not devices:
+
+            print()
+            print(
+                "No registered PixelSentinel "
+                "devices found."
+            )
+            print()
+
+            return
+
+
+        display_registered_devices(
+            devices
+        )
+
+
+        subscription_choice = input(
+            "\nEnter the Subscription ID to manage "
+            "(or X to return): "
+        ).strip()
+
+
+        if subscription_choice.upper() == "X":
+
+            return
+
+
+        if not subscription_choice.isdigit():
+
+            print()
+            print(
+                "Invalid Subscription ID."
+            )
+            print()
+
+            continue
+
+
+        subscription_id = int(
+            subscription_choice
+        )
+
+
+        device = get_registered_device(
+            subscription_id
+        )
+
+
+        if device is None:
+
+            print()
+            print(
+                f"Subscription ID {subscription_id} "
+                "does not exist."
+            )
+            print()
+
+            continue
+
+
+        (
+            subscription_id,
+            member_id,
+            member_name,
+            device_label,
+            platform,
+            enabled,
+            failure_count,
+            created_at,
+            last_success_at
+        ) = device
+
+
+        current_status = (
+            "Enabled"
+            if enabled
+            else "Disabled"
+        )
+
+
+        print()
+        print("Selected Device:")
+        print()
+        print(
+            f"  Subscription ID: {subscription_id}"
+        )
+        print(
+            f"  Member:          {member_name}"
+        )
+        print(
+            f"  Member ID:       {member_id}"
+        )
+        print(
+            f"  Device:          {device_label or 'Unknown'}"
+        )
+        print(
+            f"  Platform:        {platform or 'other'}"
+        )
+        print(
+            f"  Current Status:  {current_status}"
+        )
+        print()
+
+
+        if enabled:
+
+            print(
+                "D - Disable this device"
+            )
+
+        else:
+
+            print(
+                "E - Enable this device"
+            )
+
+
+        print(
+            "X - Cancel"
+        )
+
+
+        action = input(
+            "\nSelect an action: "
+        ).strip().upper()
+
+
+        if action == "X":
+
+            continue
+
+
+        if enabled and action == "D":
+
+            print()
+            print(
+                "Disabling this device will stop "
+                "PixelSentinel photo alerts from "
+                "being sent to it."
+            )
+
+            print(
+                "The device registration will remain "
+                "stored and can be enabled again later."
+            )
+            print()
+
+
+            confirm = input(
+                "Disable this device? (Y/N): "
+            ).strip().upper()
+
+
+            if confirm != "Y":
+
+                print()
+                print(
+                    "Device was not disabled."
+                )
+                print()
+
+                continue
+
+
+            updated = (
+                set_registered_device_enabled(
+                    subscription_id,
+                    False
+                )
+            )
+
+
+            if updated:
+
+                print()
+                print(
+                    f"Subscription {subscription_id} "
+                    "was disabled successfully."
+                )
+                print()
+
+            else:
+
+                print()
+                print(
+                    "The device status could not "
+                    "be changed."
+                )
+                print()
+
+
+        elif (
+            not enabled
+            and action == "E"
+        ):
+
+            updated = (
+                set_registered_device_enabled(
+                    subscription_id,
+                    True
+                )
+            )
+
+
+            if updated:
+
+                print()
+                print(
+                    f"Subscription {subscription_id} "
+                    "was enabled successfully."
+                )
+                print()
+
+            else:
+
+                print()
+                print(
+                    "The device status could not "
+                    "be changed."
+                )
+                print()
+
+
+        else:
+
+            print()
+            print(
+                "Invalid selection."
+            )
+            print()
+
+def get_push_subscription_delivery_data(
+    subscription_id
+):
+    """
+    Retrieve the internal Web Push information required
+    to send a removal command.
+
+    These values must never be displayed or logged.
+    """
+
+    try:
+
+        result = db_execute(
+            '''
+            SELECT
+                subscription_id,
+                endpoint,
+                p256dh,
+                auth
+
+            FROM push_subscriptions
+
+            WHERE subscription_id = ?
+            ''',
+            (
+                subscription_id,
+            ),
+            fetch=True
+        )
+
+
+        if not result:
+
+            return None
+
+
+        (
+            subscription_id,
+            endpoint,
+            p256dh,
+            auth
+        ) = result[0]
+
+
+        return {
+            "subscription_id":
+                subscription_id,
+
+            "endpoint":
+                endpoint,
+
+            "keys": {
+                "p256dh":
+                    p256dh,
+
+                "auth":
+                    auth
+            }
+        }
+
+
+    except ValueError:
+
+        return None
+
+def create_subscription_removal_transaction(
+    subscription_id
+):
+    """
+    Create a one-time remote removal transaction.
+
+    Only the SHA-256 removal-token hash is stored.
+    The push subscription is immediately disabled.
+    """
+
+    removal_token = secrets.token_urlsafe(
+        32
+    )
+
+
+    token_hash = hashlib.sha256(
+        removal_token.encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+    expires_at = (
+        datetime.now(
+            timezone.utc
+        )
+        + timedelta(
+            minutes=
+                REMOVAL_LIFETIME_MINUTES
+        )
+    ).isoformat()
+
+
+    connection = None
+
+
+    try:
+
+        connection = sqlite3.connect(
+            db_file,
+            timeout=5
+        )
+
+        connection.execute(
+            "PRAGMA foreign_keys = ON"
+        )
+
+        connection.execute(
+            "PRAGMA busy_timeout = 5000"
+        )
+
+        connection.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+
+        subscription = connection.execute(
+            '''
+            SELECT subscription_id
+
+            FROM push_subscriptions
+
+            WHERE subscription_id = ?
+            ''',
+            (
+                subscription_id,
+            )
+        ).fetchone()
+
+
+        if subscription is None:
+
+            connection.rollback()
+
+            return None
+
+
+        connection.execute(
+            '''
+            INSERT INTO subscription_removals (
+                subscription_id,
+                token_hash,
+                expires_at,
+                attempt_count,
+                last_attempt_at,
+                last_error
+            )
+
+            VALUES (?, ?, ?, 0, NULL, NULL)
+
+            ON CONFLICT(subscription_id)
+
+            DO UPDATE SET
+                token_hash =
+                    excluded.token_hash,
+
+                requested_at =
+                    CURRENT_TIMESTAMP,
+
+                expires_at =
+                    excluded.expires_at,
+
+                attempt_count =
+                    0,
+
+                last_attempt_at =
+                    NULL,
+
+                last_error =
+                    NULL
+            ''',
+            (
+                subscription_id,
+                token_hash,
+                expires_at
+            )
+        )
+
+
+        connection.execute(
+            '''
+            UPDATE push_subscriptions
+
+            SET
+                enabled = 0,
+                updated_at =
+                    CURRENT_TIMESTAMP
+
+            WHERE subscription_id = ?
+            ''',
+            (
+                subscription_id,
+            )
+        )
+
+
+        connection.commit()
+
+
+        return removal_token
+
+
+    except sqlite3.Error:
+
+        if connection is not None:
+
+            connection.rollback()
+
+
+        return None
+
+
+    finally:
+
+        if connection is not None:
+
+            connection.close()
+def record_removal_attempt(
+    subscription_id
+):
+    """
+    Record that PixelSentinel attempted to send a
+    removal command.
+    """
+
+    try:
+
+        db_execute(
+            '''
+            UPDATE subscription_removals
+
+            SET
+                attempt_count =
+                    attempt_count + 1,
+
+                last_attempt_at =
+                    CURRENT_TIMESTAMP,
+
+                last_error =
+                    NULL
+
+            WHERE subscription_id = ?
+            ''',
+            (
+                subscription_id,
+            )
+        )
+
+
+    except ValueError:
+
+        pass
+
+def record_removal_send_failure(
+    subscription_id
+):
+    """
+    Record only a generic removal delivery failure.
+
+    Provider responses are deliberately not stored.
+    """
+
+    try:
+
+        db_execute(
+            '''
+            UPDATE subscription_removals
+
+            SET last_error =
+                'push_send_failed'
+
+            WHERE subscription_id = ?
+            ''',
+            (
+                subscription_id,
+            )
+        )
+
+
+    except ValueError:
+
+        pass
+
+def send_subscription_removal_command(
+    subscription_id,
+    removal_token
+):
+    """
+    Send the encrypted browser-removal command.
+
+    Push credentials and provider errors are never
+    displayed by sentinelmanage.
+    """
+
+    subscription = (
+        get_push_subscription_delivery_data(
+            subscription_id
+        )
+    )
+
+
+    if subscription is None:
+
+        return False
+
+
+    record_removal_attempt(
+        subscription_id
+    )
+
+
+    payload = {
+        "type":
+            "subscription_removal",
+
+        "removal_token":
+            removal_token
+    }
+
+
+    try:
+
+        import pixelsentinel_web
+
+
+        pixelsentinel_web.send_web_push(
+            subscription,
+            payload,
+            ttl=
+                REMOVAL_PUSH_TTL_SECONDS
+        )
+
+
+        return True
+
+
+    except Exception:
+
+        record_removal_send_failure(
+            subscription_id
+        )
+
+        return False
+
+def wait_for_subscription_removal(
+    subscription_id
+):
+    """
+    Wait briefly for the browser to acknowledge the
+    remote unsubscribe operation.
+
+    Returns True when the push_subscriptions row has
+    disappeared.
+    """
+
+    deadline = (
+        time.monotonic()
+        + REMOVAL_ACK_WAIT_SECONDS
+    )
+
+
+    while time.monotonic() < deadline:
+
+        try:
+
+            result = db_execute(
+                '''
+                SELECT subscription_id
+
+                FROM push_subscriptions
+
+                WHERE subscription_id = ?
+                ''',
+                (
+                    subscription_id,
+                ),
+                fetch=True
+            )
+
+
+            if not result:
+
+                return True
+
+
+        except ValueError:
+
+            return False
+
+
+        time.sleep(
+            1
+        )
+
+
+    return False
+
+def remove_registered_device():
+    """
+    Begin secure remote removal of a PixelSentinel
+    push device.
+
+    Local deletion occurs only after the browser
+    acknowledges successful unsubscribe.
+    """
+
+    devices = get_registered_devices()
+
+
+    if not devices:
+
+        print()
+        print(
+            "No registered PixelSentinel "
+            "devices found."
+        )
+        print()
+
+        return
+
+
+    display_registered_devices(
+        devices
+    )
+
+
+    choice = input(
+        "\nEnter the Subscription ID to remove "
+        "(or X to cancel): "
+    ).strip()
+
+
+    if choice.upper() == "X":
+
+        print()
+        print(
+            "Device removal canceled."
+        )
+        print()
+
+        return
+
+
+    if not choice.isdigit():
+
+        print()
+        print(
+            "Invalid Subscription ID."
+        )
+        print()
+
+        return
+
+
+    subscription_id = int(
+        choice
+    )
+
+
+    device = get_registered_device(
+        subscription_id
+    )
+
+
+    if device is None:
+
+        print()
+        print(
+            f"Subscription ID {subscription_id} "
+            "does not exist."
+        )
+        print()
+
+        return
+
+
+    (
+        subscription_id,
+        member_id,
+        member_name,
+        device_label,
+        platform,
+        enabled,
+        failure_count,
+        created_at,
+        last_success_at
+    ) = device
+
+
+    print()
+    print("=" * 60)
+    print("REMOVE PIXELSENTINEL DEVICE")
+    print("=" * 60)
+    print()
+
+    print(
+        f"Subscription ID: {subscription_id}"
+    )
+
+    print(
+        f"Member:          {member_name}"
+    )
+
+    print(
+        f"Member ID:       {member_id}"
+    )
+
+    print(
+        f"Device:          "
+        f"{device_label or 'Unknown'}"
+    )
+
+    print(
+        f"Platform:        "
+        f"{platform or 'other'}"
+    )
+
+    print()
+
+    print(
+        "WARNING:"
+    )
+
+    print(
+        "This will remotely unsubscribe this "
+        "browser from PixelSentinel push alerts."
+    )
+
+    print()
+
+    print(
+        "To use this device again, it must be "
+        "enrolled with a new invitation."
+    )
+
+    print()
+
+
+    confirm = input(
+        "Type REMOVE to continue: "
+    ).strip()
+
+
+    if confirm != "REMOVE":
+
+        print()
+        print(
+            "Device removal canceled."
+        )
+        print()
+
+        return
+
+
+    removal_token = (
+        create_subscription_removal_transaction(
+            subscription_id
+        )
+    )
+
+
+    if removal_token is None:
+
+        print()
+        print(
+            "Unable to create the secure "
+            "device-removal request."
+        )
+        print()
+
+        return
+
+
+    sent = (
+        send_subscription_removal_command(
+            subscription_id,
+            removal_token
+        )
+    )
+
+
+    # Stop intentionally retaining our reference to
+    # the raw removal credential.
+    removal_token = None
+
+
+    if not sent:
+
+        print()
+        print(
+            "PixelSentinel could not send the "
+            "device-removal command."
+        )
+
+        print(
+            "The device has been disabled and the "
+            "removal remains pending."
+        )
+
+        print(
+            "No local subscription record was deleted."
+        )
+        print()
+
+        return
+
+
+    print()
+    print(
+        "Removal command sent."
+    )
+
+    print(
+        "Waiting for the device to confirm "
+        "remote unsubscribe..."
+    )
+
+
+    removed = (
+        wait_for_subscription_removal(
+            subscription_id
+        )
+    )
+
+
+    if removed:
+
+        print()
+        print(
+            f"Subscription {subscription_id} "
+            "was removed successfully."
+        )
+
+        print(
+            "The browser confirmed that its "
+            "push subscription was unsubscribed."
+        )
+        print()
+
+
+    else:
+
+        print()
+        print(
+            "The removal command was accepted by "
+            "the push service."
+        )
+
+        print(
+            "The browser has not yet acknowledged "
+            "the unsubscribe operation."
+        )
+
+        print(
+            "The device remains disabled and is "
+            "marked as pending removal."
+        )
+        print()
+
 def main():
+    initialize_membership_tables()
+    initialize_push_removal_tables()    
     main_menu()
 
 if __name__ == "__main__":

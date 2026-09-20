@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>PixelSentinel Alerts</title>
+
+    <meta
+        name="theme-color"
+        content="#111827"
+    >
+
+    <meta
+        name="apple-mobile-web-app-capable"
+        content="yes"
+    >
+
+    <meta
+        name="mobile-web-app-capable"
+        content="yes"
+    >
+
+    <meta
+        name="apple-mobile-web-app-title"
+        content="Photo Alerts"
+    >
+
+    <link
+        rel="manifest"
+        href="{{ url_for(
+            'enrollment_manifest',
+            token=token
+        ) }}"
+    >
+
+    <link
+        rel="apple-touch-icon"
+        href="/static/icons/apple-touch-icon.png"
+    >
+
+    <link
+        rel="stylesheet"
+        href="/static/css/enroll.css"
+    >
+
+</head>
+
+<body>
+
+    <main class="container">
+
+        <section class="card">
+
+            <h1>PixelSentinel Alerts</h1>
+
+            <p class="welcome">
+                Hello {{ member_name }}.
+            </p>
+
+            <p>
+                PixelSentinel can notify you when new
+                photos are uploaded to an album you
+                have access to.
+            </p>
+
+            <div
+                id="secure-warning"
+                class="warning hidden"
+            >
+                PixelSentinel is currently running in
+                test mode without HTTPS.
+
+                Device detection can be tested, but
+                notification setup will require the
+                secure PixelSentinel address.
+            </div>
+
+
+            <div id="device-status">
+
+                <p>
+                    Detecting your device...
+                </p>
+
+            </div>
+
+
+            <!-- iPhone / iPad -->
+
+            <section
+                id="ios-setup"
+                class="setup-section hidden"
+            >
+
+                <h2>iPhone detected</h2>
+
+                <div
+                    id="ios-install-required"
+                    class="hidden"
+                >
+
+                    <p>
+                        PixelSentinel Alerts needs to be
+                        added to your Home Screen before
+                        iPhone notifications can be enabled.
+                    </p>
+
+                    <ol>
+                        <li>
+                            Open this private link in Safari.
+                        </li>
+
+                        <li>
+                            Tap the Share button.
+                        </li>
+
+                        <li>
+                            Tap
+                            <strong>Add to Home Screen</strong>.
+                        </li>
+
+                        <li id="ios26-step" class="hidden">
+                            Make sure
+                            <strong>Open as Web App</strong>
+                            remains enabled.
+                        </li>
+
+                        <li>
+                            Tap <strong>Add</strong>.
+                        </li>
+
+                        <li>
+                            Close Safari and open
+                            <strong>PixelSentinel</strong>
+                            from your Home Screen.
+                        </li>
+                    </ol>
+
+                    <p class="instruction-note">
+                        After reopening PixelSentinel from
+                        the Home Screen, this page will
+                        automatically recognize that the setup
+                        step is complete.
+                    </p>
+
+                </div>
+
+
+                <div
+                    id="ios-installed"
+                    class="success hidden"
+                >
+
+                    <strong>
+                        Home Screen setup complete.
+                    </strong>
+
+                    <p>
+                        This iPhone is ready for notification
+                        activation.
+                    </p>
+
+                </div>
+
+            </section>
+
+
+            <!-- Android -->
+
+            <section
+                id="android-setup"
+                class="setup-section hidden"
+            >
+
+                <h2>Android detected</h2>
+
+                <div
+                    id="android-ready"
+                    class="success"
+                >
+
+                    <strong>
+                        Your Android device is ready.
+                    </strong>
+
+                    <p>
+                        Installing PixelSentinel on your
+                        Home Screen is optional.
+                    </p>
+
+                </div>
+
+                <button
+                    id="android-install"
+                    class="secondary-button hidden"
+                    type="button"
+                >
+                    Add PixelSentinel to Home Screen
+                </button>
+
+            </section>
+
+
+            <!-- Other -->
+
+            <section
+                id="other-setup"
+                class="setup-section hidden"
+            >
+
+                <h2>Desktop detected</h2>
+
+                <p>
+                    Web Push capability will be checked
+                    automatically before notifications
+                    are enabled.
+                </p>
+
+            </section>
+
+
+            <!-- Capability check -->
+
+            <section class="capabilities">
+
+                <h2>Notification readiness</h2>
+
+                <div id="capability-list">
+                </div>
+
+            </section>
+
+
+            <div
+    id="push-enrollment"
+    data-invite-used="{{ 'true' if invite_used else 'false' }}"
+>
+    <div
+        id="push-status"
+        role="status"
+        aria-live="polite"
+    ></div>
+
+    {% if invite_used %}
+
+        <button
+            id="enable-push-button"
+            type="button"
+            disabled
+        >
+            Photo Alerts Registered
+        </button>
+
+    {% else %}
+
+        <button
+            id="enable-push-button"
+            type="button"
+            disabled
+        >
+            Enable Photo Alerts
+        </button>
+
+    {% endif %}
+</div>
+
+        </section>
+
+    </main>
+
+    <script src="/static/js/enroll.js"></script>
+
+</body>
+
+</html>
