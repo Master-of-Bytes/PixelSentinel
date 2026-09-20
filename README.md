@@ -10,7 +10,7 @@ To run PixelSentinel you first need to install some third-party packages from sy
  ![image](https://github.com/user-attachments/assets/1645b7b5-6c86-4dac-a45f-080b8e732875)
 
 2. After you install the synocommunity package list go back to the Package Center on your NAS and look for and install the following:
-   git, python 3.11
+   git, python 3.14
 3. Setup SSH on your NAS: https://kb.synology.com/en-nz/DSM/tutorial/How_to_login_to_DSM_with_root_permission_via_SSH_Telnet
 Remember to change the SSH Port from 22.
 
@@ -28,6 +28,10 @@ SMTP_USER=youremail@gmail.com
 APP_PASS=xxxxxxxxx # Set up an app password in your Google account
 PORT=465
 SMTP_SERVER=smtp.gmail.com
+ADMIN_ALERT_EMAIL=youremail@gmail.com
+VAPID_PUBLIC_KEY=public key value
+VAPID_PRIVATE_KEY=path to private key
+VAPID_SUBJECT=mailto:youremail@gmail.com
 ```
 2. Run: `sh setup.sh`
 3. To manually run PixelSentinel, move to the PixelSentinel folder and run: `sh sentinel_start.sh`
