@@ -1,4 +1,29 @@
+# PixelSentinel private configuration
 .env
+
+# Runtime database and SQLite sidecar files
 pixelsentinel.db
-/__pycache__
-/pixelsentinel_env
+pixelsentinel.db-journal
+pixelsentinel.db-wal
+pixelsentinel.db-shm
+
+# VAPID identity
+/vapid_keys/
+
+# Runtime process files
+/run/
+
+# Runtime logs
+/logs/
+
+# Python runtime files
+/__pycache__/
+*.pyc
+
+# Python virtual environment
+/pixelsentinel_env/
+
+# OS-generated metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
