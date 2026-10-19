@@ -13,6 +13,9 @@ import sqlite3
 import hashlib
 import json
 import logging
+import ipaddress
+import socket
+import requests
 
 from datetime import datetime, timezone
 from flask import Flask, render_template, abort, jsonify, make_response, send_from_directory, url_for, request
@@ -102,6 +105,54 @@ class PushDeliveryError(Exception):
     def __init__(self):
         super().__init__(self.DEFAULT_MESSAGE)
 
+class PushEndpointValidationError(Exception):
+    """
+    Safe Web Push endpoint validation error.
+    """
+
+    DEFAULT_MESSAGE = (
+        "Invalid Web Push endpoint."
+    )
+
+    def __init__(self):
+        super().__init__(
+            self.DEFAULT_MESSAGE
+        )
+
+class HardenedPushSession(
+    requests.Session
+):
+    """
+    Requests session used only for outbound Web Push.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Prevent HTTPS_PROXY, HTTP_PROXY, NO_PROXY,
+        # or other environment proxy settings from
+        # silently changing the Web Push route.
+        self.trust_env = False
+
+    def request(
+        self,
+        method,
+        url,
+        **kwargs
+    ):
+        # A Web Push endpoint is an opaque capability URL.
+        # PixelSentinel never follows a redirect to a
+        # different destination.
+        kwargs[
+            "allow_redirects"
+        ] = False
+
+        return super().request(
+            method,
+            url,
+            **kwargs
+        )
+
 def db_execute(query, params=(), fetch=False):
     connection = sqlite3.connect(DB_FILE)
     connection.execute("PRAGMA foreign_keys = ON")
@@ -131,19 +182,18 @@ def hash_invite_token(token):
     """
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
+"""
+Validate a PixelSentinel enrollment invitation.
 
-def validate_invite(token, allow_used=False):
-    """
-    Validate a PixelSentinel enrollment invitation.
-
-    Rules:
-      - Revoked invites are always rejected.
-      - Unused invites must still be unexpired.
-      - Used invites may still load the existing PWA when
+  Rules:
+     - Revoked invites are always rejected.
+     - Unused invites must still be unexpired.
+     - Used invites may still load the existing PWA when
         allow_used=True.
-      - Used invites may not enroll another device when
+     - Used invites may not enroll another device when
         allow_used=False.
-    """
+"""
+def validate_invite(token, allow_used=False):
 
     if not token:
         return None
@@ -222,14 +272,15 @@ def validate_invite(token, allow_used=False):
         "used_at": None,
         "used": False,
     }
+    
+"""
+ Return a friendly device label.
 
+ Platform information is informational only and does
+ not determine authorization.
+"""
 def get_device_label(platform):
-    """
-    Return a friendly device label.
 
-    Platform information is informational only and does
-    not determine authorization.
-    """
 
     if platform == "ios":
         return "iPhone / iPad"
@@ -238,25 +289,244 @@ def get_device_label(platform):
         return "Android"
 
     return "Web Browser"
-    
-def get_endpoint_fingerprint(endpoint):
-    """
+
+"""
+    Validate a browser-provided Web Push endpoint
+    before it is stored or contacted.
+
+    Returns the stripped endpoint on success.
+
+    Raises:
+        PushEndpointValidationError
+"""
+def validate_web_push_endpoint(
+    endpoint
+):
+    if not isinstance(
+        endpoint,
+        str
+    ):
+
+        raise PushEndpointValidationError()
+
+    endpoint = endpoint.strip()
+
+    if (
+        not endpoint
+        or len(endpoint) > 4096
+    ):
+
+        raise PushEndpointValidationError()
+
+    try:
+
+        parsed = urlparse(
+            endpoint
+        )
+
+    except ValueError:
+
+        raise PushEndpointValidationError()
+
+    # RFC 8030 Web Push endpoints use HTTPS.
+    if parsed.scheme.lower() != "https":
+
+        raise PushEndpointValidationError()
+
+    # Credentials must never be embedded in the URL.
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+    ):
+
+        raise PushEndpointValidationError()
+
+    hostname = parsed.hostname
+
+    if not hostname:
+
+        raise PushEndpointValidationError()
+
+    # URL fragments are never needed for a Web Push
+    # delivery endpoint.
+    if parsed.fragment:
+
+        raise PushEndpointValidationError()
+
+    try:
+
+        port = parsed.port
+
+    except ValueError:
+
+        raise PushEndpointValidationError()
+
+    if port is None:
+
+        port = 443
+
+    # RFC 8030 uses 443 by default and reserves
+    # 1001 as the alternate Web Push service port.
+    if port not in (
+        443,
+        1001
+    ):
+
+        raise PushEndpointValidationError()
+
+    hostname = (
+        hostname
+        .rstrip(".")
+        .lower()
+    )
+
+    if not hostname:
+
+        raise PushEndpointValidationError()
+
+    # Explicitly reject common local-only namespaces.
+    local_names = (
+        "localhost",
+        ".localhost",
+        ".local",
+        ".localdomain",
+        ".home.arpa",
+    )
+
+    if (
+        hostname == "localhost"
+        or any(
+            hostname.endswith(
+                suffix
+            )
+            for suffix
+            in local_names[1:]
+        )
+    ):
+
+        raise PushEndpointValidationError()
+
+    # PixelSentinel intentionally requires a DNS
+    # hostname rather than accepting a literal IP.
+    #
+    # Browser push providers normally issue hostname-
+    # based HTTPS capability URLs, and refusing literal
+    # addresses substantially reduces SSRF exposure.
+    try:
+
+        ipaddress.ip_address(
+            hostname
+        )
+
+    except ValueError:
+
+        # Not an IP literal. Continue with DNS.
+        pass
+
+    else:
+
+        raise PushEndpointValidationError()
+
+
+    # Normalize internationalized hostnames before DNS.
+    try:
+
+        dns_hostname = (
+            hostname
+            .encode("idna")
+            .decode("ascii")
+        )
+
+    except UnicodeError:
+
+        raise PushEndpointValidationError()
+
+    try:
+
+        address_info = (
+            socket.getaddrinfo(
+                dns_hostname,
+                port,
+                type=socket.SOCK_STREAM
+            )
+        )
+
+    except (
+        socket.gaierror,
+        OSError
+    ):
+
+        raise PushEndpointValidationError()
+
+    if not address_info:
+
+        raise PushEndpointValidationError()
+
+    resolved_addresses = set()
+
+    for result in address_info:
+
+        sockaddr = result[4]
+
+        if not sockaddr:
+
+            raise PushEndpointValidationError()
+
+        address_text = (
+            sockaddr[0]
+            .split(
+                "%",
+                1
+            )[0]
+        )
+
+        try:
+
+            address = (
+                ipaddress.ip_address(
+                    address_text
+                )
+            )
+
+        except ValueError:
+
+            raise PushEndpointValidationError()
+
+        resolved_addresses.add(
+            address
+        )
+
+    if not resolved_addresses:
+
+        raise PushEndpointValidationError()
+
+    # Fail closed if even ONE DNS result points to a
+    # non-public destination.
+    #
+    # This blocks loopback, RFC1918/private ranges,
+    # link-local, multicast, unspecified, documentation
+    # ranges, CGNAT/non-global space, etc.
+    for address in resolved_addresses:
+
+        if not address.is_global:
+
+            raise PushEndpointValidationError()
+
+    return endpoint
+
+"""
     Create a short, non-secret identifier for log correlation.
 
     The actual Web Push endpoint is not written to logs.
-    """
+"""    
+def get_endpoint_fingerprint(endpoint):
+    
 
     return hashlib.sha256(
         endpoint.encode("utf-8")
     ).hexdigest()[:12]
-    
-def save_push_subscription(
-    member_id,
-    subscription,
-    platform,
-    user_agent
-):
-    """
+
+"""
     Store or refresh a Web Push subscription.
 
     Returns:
@@ -264,8 +534,13 @@ def save_push_subscription(
 
     Raises:
         PushSubscriptionStoreError
-    """
-
+"""
+def save_push_subscription(
+    member_id,
+    subscription,
+    platform,
+    user_agent
+):
     # member_id is expected to have been derived internally
     # from a validated invitation.
     if (
@@ -319,6 +594,19 @@ def save_push_subscription(
     ):
         logger.warning(
             "Rejected oversized push subscription payload."
+        )
+
+        raise PushSubscriptionStoreError()
+
+    # Validate web push endpoint
+    try:
+        endpoint = (validate_web_push_endpoint(endpoint))
+
+    except PushEndpointValidationError:
+
+        logger.warning(
+            "Rejected unsafe Web Push "
+            "subscription endpoint."
         )
 
         raise PushSubscriptionStoreError()
@@ -528,15 +816,16 @@ def build_webpush_subscription(
             "auth": auth.strip(),
         }
     }
-
+    
+"""
+ Send an encrypted Web Push notification.
+"""
 def send_web_push(
     subscription,
     payload,
     ttl=60
 ):
-    """
-    Send an encrypted Web Push notification.
-    """
+ 
 
     if not isinstance(subscription, dict):
         raise PushDeliveryError()
@@ -578,17 +867,37 @@ def send_web_push(
 
         raise PushDeliveryError()
 
+# Validate web push endpoint
     try:
-        webpush(
-            subscription_info=subscription,
-            data=json.dumps(payload),
-            vapid_private_key=VAPID_PRIVATE_KEY,
-            vapid_claims={
-                "sub": VAPID_SUBJECT
-            },
-            ttl=ttl,
-            timeout=10,
+        endpoint = (validate_web_push_endpoint(endpoint))
+
+    except PushEndpointValidationError:
+
+        logger.warning(
+            "Blocked unsafe Web Push "
+            "endpoint before delivery. "
+            "Endpoint fingerprint: %s",
+            get_endpoint_fingerprint(
+                endpoint
+            )
         )
+
+        raise PushDeliveryError()
+
+    try:
+        with HardenedPushSession() as push_session:
+
+            webpush(
+                subscription_info=subscription,
+                data=json.dumps(payload),
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={
+                    "sub": VAPID_SUBJECT
+                },
+                ttl=ttl,
+                timeout=10,
+                requests_session=push_session,
+            )
 
     except WebPushException as error:
 
@@ -660,20 +969,63 @@ def is_valid_request_origin():
         return False
 
     return True
+    
 
+"""
+    Record the delivery result for a Web Push
+    subscription.
+
+    Successful delivery:
+        - resets failure_count
+        - clears last_error
+        - records last_success_at
+
+    Failed delivery:
+        - increments failure_count
+        - stores only a generic safe failure code
+        - preserves last_success_at
+
+    Raw provider errors are never stored.
+"""
 def record_subscription_delivery_result(
     subscription_id,
-    success
+    success,
+    failure_code="push_send_failed"
 ):
-    """
-    Record the result of a push delivery attempt.
 
-    Raw provider errors are deliberately not stored.
-    """
+
+    if (
+        not isinstance(subscription_id, int)
+        or isinstance(subscription_id, bool)
+        or subscription_id < 1
+    ):
+
+        return False
+
+
+    if not isinstance(
+        success,
+        bool
+    ):
+
+        return False
+        
+    allowed_failure_codes = {
+        "push_send_failed",
+        "test_push_failed"
+    }
+
+
+    if failure_code not in allowed_failure_codes:
+
+        failure_code = (
+            "push_send_failed"
+        )
 
     connection = None
 
     try:
+
         connection = sqlite3.connect(
             DB_FILE,
             timeout=5
@@ -689,52 +1041,80 @@ def record_subscription_delivery_result(
 
         if success:
 
-            connection.execute(
-                """
+            cursor = connection.execute(
+                '''
                 UPDATE push_subscriptions
+
                 SET
                     failure_count = 0,
                     last_error = NULL,
-                    last_success_at = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP
+                    last_success_at =
+                        CURRENT_TIMESTAMP,
+                    admin_alert_sent_at = NULL,    
+                    updated_at =
+                        CURRENT_TIMESTAMP
+
                 WHERE subscription_id = ?
-                """,
-                (subscription_id,),
+                ''',
+                (
+                    subscription_id,
+                )
             )
 
         else:
 
-            connection.execute(
-                """
+            cursor = connection.execute(
+                '''
                 UPDATE push_subscriptions
+
                 SET
                     failure_count =
                         failure_count + 1,
-                    last_error = 'test_push_failed',
-                    updated_at = CURRENT_TIMESTAMP
+
+                    last_error = ?,
+
+                    updated_at =
+                        CURRENT_TIMESTAMP
+
                 WHERE subscription_id = ?
-                """,
-                (subscription_id,),
+                ''',
+                (
+                    failure_code,
+                    subscription_id
+                )
             )
+
+        if cursor.rowcount != 1:
+
+            connection.rollback()
+
+            return False
 
         connection.commit()
 
+        return True
+
     except sqlite3.Error:
+
         if connection is not None:
+
             connection.rollback()
 
-        logger.exception(
-            "Unable to update push delivery status."
+        logging.exception(
+            "Database error while recording "
+            "Web Push delivery result."
         )
 
-        raise
+        return False
+
 
     finally:
+
         if connection is not None:
+
             connection.close()
             
-def consume_member_invite(invite_id):
-    """
+"""
     Atomically mark an unused, non-revoked invitation
     as used.
 
@@ -742,7 +1122,10 @@ def consume_member_invite(invite_id):
     consumed.
 
     Database details are never exposed to the client.
-    """
+"""
+def consume_member_invite(invite_id):
+
+
 
     if (
         not isinstance(invite_id, int)
@@ -952,7 +1335,8 @@ def subscribe_push(token):
         try:
             record_subscription_delivery_result(
                 subscription_id,
-                success=False
+                success=False,
+                failure_code="test_push_failed"
             )
 
         except Exception:
@@ -1515,7 +1899,7 @@ if __name__ == "__main__":
         )
 
     app.run(
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=5055,
         debug=False,
     )

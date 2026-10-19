@@ -8,6 +8,8 @@ user set up the groups and members tables or add new albums.
 Later runs check and update the files and albums tables.
 
 Date: 11/25/2024
+
+V2: 9/22/26 - Push alert system to replace email alerts
 """
 import sys
 import time
@@ -35,7 +37,108 @@ shared_photos = os.getenv('SHARED_PHOTOS')
 db_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pixelsentinel.db')
 requirements_file = os.path.join(os.path.dirname(__file__), 'requirements.txt')
 
+# Administrator-only email alert configuration
+ADMIN_ALERT_EMAIL = os.getenv(
+    "ADMIN_ALERT_EMAIL",
+    ""
+).strip()
 
+SMTP_SERVER = os.getenv(
+    "SMTP_SERVER",
+    ""
+).strip()
+
+SMTP_PORT = os.getenv(
+    "SMTP_PORT",
+    ""
+).strip()
+
+SMTP_USER = os.getenv(
+    "SMTP_USER",
+    ""
+).strip()
+
+SMTP_APP_PASSWORD = os.getenv(
+    "APP_PASS",
+    ""
+).strip()
+
+SENDER_EMAIL = os.getenv(
+    "SENDER_EMAIL",
+    ""
+).strip()
+
+
+# Validate the administrator-only SMTP configuration.
+
+def validate_admin_email_configuration():
+
+    problems = []
+
+
+    if not ADMIN_ALERT_EMAIL:
+        problems.append(
+            "ADMIN_ALERT_EMAIL is missing."
+        )
+
+
+    if not SMTP_SERVER:
+        problems.append(
+            "SMTP_SERVER is missing."
+        )
+
+
+    if not SMTP_PORT:
+        problems.append(
+            "SMTP_PORT is missing."
+        )
+
+    else:
+
+        try:
+
+            port = int(
+                SMTP_PORT
+            )
+
+
+            if (
+                port < 1
+                or port > 65535
+            ):
+
+                problems.append(
+                    "SMTP_PORT is invalid."
+                )
+
+
+        except ValueError:
+
+            problems.append(
+                "SMTP_PORT is invalid."
+            )
+
+
+    if not SMTP_USER:
+        problems.append(
+            "SMTP_USER is missing."
+        )
+
+
+    if not SMTP_APP_PASSWORD:
+        problems.append(
+            "APP_PASS is missing."
+        )
+
+
+    if not SENDER_EMAIL:
+        problems.append(
+            "SENDER_EMAIL is missing."
+        )
+
+
+    return problems
+    
 def db_execute(query, params=(), fetch=False):
     connection = sqlite3.connect(db_file)
     connection.execute("PRAGMA foreign_keys = ON")
@@ -87,6 +190,7 @@ def initialize_notification_tables():
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 last_success_at TEXT,
+                admin_alert_sent_at TEXT,
                 FOREIGN KEY (member_id)
                     REFERENCES members(member_id)
                     ON DELETE CASCADE
@@ -348,108 +452,1468 @@ def get_album_photo_counts(file_entries):
 
     return dict(album_photo_counts)
 
- # List all album groups based on album name
-def get_album_groups(album_name):
-    try:
-        group_names = db_execute('''
-        SELECT groups.name AS GroupName
-        FROM albums JOIN
-        groups ON albums.group_id = groups.group_id
-        WHERE 
-        albums.name = ? 
-                ''',(album_name,), fetch=True)
+# Get all unique members assigned to an album
+def get_album_members(album_name):
+    """
+    Return each unique member who should receive alerts
+    for an album.
 
-        if not group_names:
-            print("No groups found.\n")
-            return
-        else:
-            return group_names
-    except ValueError as e:
-        print(f"Error interacting with the database: {e}")
-        return
+    A member is returned only once even if that person
+    belongs to multiple groups linked to the same album.
+    """
 
-# Get member info with album based on album/group name
-def get_member_info(album_name, group_name):
     try:
-        member_info = db_execute(
+
+        members = db_execute(
             '''
             SELECT DISTINCT
                 members.member_id,
-                members.name AS member_name
+                members.name
+
             FROM albums
+
             JOIN groups
-                ON albums.group_id = groups.group_id
+                ON albums.group_id =
+                   groups.group_id
+
             JOIN member_groups
-                ON groups.group_id = member_groups.group_id
+                ON groups.group_id =
+                   member_groups.group_id
+
             JOIN members
-                ON member_groups.member_id = members.member_id
+                ON member_groups.member_id =
+                   members.member_id
+
             WHERE albums.name = ?
-              AND groups.name = ?
-            ORDER BY members.name
+
+            ORDER BY
+                members.name COLLATE NOCASE,
+                members.member_id
             ''',
-            (album_name, group_name),
+            (
+                album_name,
+            ),
             fetch=True
         )
 
-        if not member_info:
-            print("No members found.\n")
-            return []
-
-        return member_info
+        return members or []
 
     except ValueError as e:
-        print(f"Error interacting with the database: {e}")
+
+        print(
+            f"Error retrieving members for "
+            f"album '{album_name}': {e}"
+        )
+
         return []
 
-def sendalerts(_new_photo_count):
-    members = {}  # Initialize members as a dictionary
+# Get all enabled push devices for a member
+def get_enabled_push_subscriptions(
+    member_id
+):
+    """
+    Return every enabled Web Push subscription for
+    a member.
+    """
 
-    # Loop through the albums and their counts
-    for album, count in _new_photo_count.items():
-        # Get a list of groups for the current album
-        group_list = get_album_groups(album)
+    try:
 
-        # Initialize the album in the members dictionary if not already present
-        if album not in members:
-            members[album] = set()  # Use a set to ensure uniqueness
+        subscriptions = db_execute(
+            '''
+            SELECT
+                subscription_id,
+                endpoint,
+                p256dh,
+                auth,
+                platform,
+                device_label
 
-        # Process each group in the group list
-        for group in group_list:  # group_list contains tuples
-            group_name = group[0]  # Extract the group name from the tuple
-            member_info_list = get_member_info(album, group_name)  # This returns a list of tuples
+            FROM push_subscriptions
 
-            # Add each member info to the set (deduplication happens here)
-            for member_info in member_info_list:
-                members[album].add(member_info)
+            WHERE member_id = ?
+              AND enabled = 1
 
-    # Convert the sets back to lists for the final result
-    members = {album: list(member_set) for album, member_set in members.items()}
+            ORDER BY subscription_id
+            ''',
+            (
+                member_id,
+            ),
+            fetch=True
+        )
 
-    # Create the message
-    for album, member_list in members.items():
-        photo_count = _new_photo_count[album]  # Get the photo count for the album
-        now = datetime.now()
-        senddt = now.strftime('%m/%d/%Y at %I:%M %p')
-        for member_name, email in member_list:
-            subject = 'PixelSentinel: New Photo(s) Added'
-            message = f'{member_name}, {photo_count} new photo(s) added to the album {album} on {senddt}.'
-            msg = MIMEMultipart()
-            msg['From'] = os.getenv('SENDER_EMAIL')
-            msg['To'] = email
-            msg['Subject'] = subject
-            msg.attach(MIMEText(message, 'plain'))
+        results = []
 
-            # Create a secure SSL context
-            context = ssl.create_default_context()
-            try:
-                with smtplib.SMTP_SSL(os.getenv('SMTP_SERVER'), int(os.getenv('PORT')), context=context) as smtp:
-                    smtp.login(os.getenv('SMTP_USER'), os.getenv('APP_PASS'))
+        for (
+            subscription_id,
+            endpoint,
+            p256dh,
+            auth,
+            platform,
+            device_label
+        ) in subscriptions or []:
 
-                    # Send the alert
-                    smtp.send_message(msg)
-                    print(f'Alert sent successfully to {member_name}.')
-            except Exception as e:
-                print(f'Error: {e}')
+            results.append(
+                {
+                    "subscription_id":
+                        subscription_id,
+
+                    "platform":
+                        platform or "other",
+
+                    "device_label":
+                        device_label or "Unknown",
+
+                    "subscription_info": {
+                        "endpoint":
+                            endpoint,
+
+                        "keys": {
+                            "p256dh":
+                                p256dh,
+
+                            "auth":
+                                auth
+                        }
+                    }
+                }
+            )
+
+
+        return results
+
+    except ValueError as e:
+
+        print(
+            f"Error retrieving push devices "
+            f"for member ID {member_id}: {e}"
+        )
+
+        return []
+
+def get_album_delivery_summary(
+    album_name
+):
+    """
+    Build a safe administrative summary of who would
+    receive a notification for an album.
+    """
+
+    summary = []
+
+    members = get_album_members(
+        album_name
+    )
+
+    for (
+        member_id,
+        member_name
+    ) in members:
+
+        subscriptions = (
+            get_enabled_push_subscriptions(
+                member_id
+            )
+        )
+
+        summary.append(
+            {
+                "member_id":
+                    member_id,
+
+                "member_name":
+                    member_name,
+
+                "enabled_devices":
+                    len(
+                        subscriptions
+                    ),
+
+                "subscription_ids": [
+                    subscription[
+                        "subscription_id"
+                    ]
+                    for subscription
+                    in subscriptions
+                ]
+            }
+        )
+
+
+    return summary
+
+# Build PixelSentinelWeb Push
+def build_web_push(
+    member_name,
+    album_name,
+    photo_count,
+    send_time=None
+):
+    """
+    Build the Web Push payload.
+    """
+
+    if not isinstance(
+        member_name,
+        str
+    ) or not member_name.strip():
+
+        raise ValueError(
+            "member_name must be a non-empty string"
+        )
+
+
+    if not isinstance(
+        album_name,
+        str
+    ) or not album_name.strip():
+
+        raise ValueError(
+            "album_name must be a non-empty string"
+        )
+
+
+    if (
+        not isinstance(
+            photo_count,
+            int
+        )
+        or isinstance(
+            photo_count,
+            bool
+        )
+        or photo_count < 1
+    ):
+
+        raise ValueError(
+            "photo_count must be a positive integer"
+        )
+
+
+    if send_time is None:
+
+        send_time = datetime.now()
+
+
+    senddt = send_time.strftime(
+        '%m/%d/%Y at %I:%M %p'
+    )
+
+
+    if photo_count == 1:
+
+        photo_text = (
+            "1 new photo"
+        )
+
+    else:
+
+        photo_text = (
+            f"{photo_count} new photos"
+        )
+
+
+    title = (
+        "PixelSentinel: New Photo(s) Added"
+    )
+
+
+    body = (
+        f"{member_name}, "
+        f"{photo_text} added to the album "
+        f"{album_name} on {senddt}."
+    )
+
+
+    return {
+        "title":
+            title,
+
+        "body":
+            body,
+
+        "type":
+            "photo_alert",
+
+        "album":
+            album_name,
+
+        "photo_count":
+            photo_count
+    }
+
+"""
+Send one PixelSentinel Web Push payload to every
+enabled push subscription belonging to a member.
+
+Each device's delivery state is updated independently.
+
+One failed device does not prevent delivery attempts
+to the member's other enabled devices.
+"""
+def send_member_web_push(
+    member_id,
+    payload,
+    ttl=60
+):
+
+    if (
+        not isinstance(member_id, int)
+        or isinstance(member_id, bool)
+        or member_id < 1
+    ):
+
+        raise ValueError(
+            "member_id must be a positive integer"
+        )
+
+    if not isinstance(
+        payload,
+        dict
+    ):
+
+        raise ValueError(
+            "payload must be a dictionary"
+        )
+
+
+    if (
+        not isinstance(ttl, int)
+        or isinstance(ttl, bool)
+        or ttl < 0
+    ):
+
+        raise ValueError(
+            "ttl must be a non-negative integer"
+        )
+
+    subscriptions = (
+        get_enabled_push_subscriptions(
+            member_id
+        )
+    )
+
+    result = {
+        "member_id":
+            member_id,
+
+        "attempted":
+            0,
+
+        "sent":
+            0,
+
+        "failed":
+            0,
+
+        "successful_subscription_ids":
+            [],
+
+        "failed_subscription_ids":
+            []
+    }
+
+    if not subscriptions:
+
+        return result
+
+    import pixelsentinel_web
+
+    for subscription in subscriptions:
+
+        subscription_id = (
+            subscription[
+                "subscription_id"
+            ]
+        )
+
+        subscription_info = (
+            subscription[
+                "subscription_info"
+            ]
+        )
+
+        result["attempted"] += 1
+
+
+        try:
+
+            pixelsentinel_web.send_web_push(
+                subscription_info,
+                payload,
+                ttl=ttl
+            )
+
+            # Record successful delivery.
+            pixelsentinel_web\
+                .record_subscription_delivery_result(
+                    subscription_id,
+                    True
+                )
+
+            result["sent"] += 1
+
+
+            result[
+                "successful_subscription_ids"
+            ].append(
+                subscription_id
+            )
+
+
+        except pixelsentinel_web.PushDeliveryError:
+
+            # Record only a generic failure state.
+            pixelsentinel_web\
+                .record_subscription_delivery_result(
+                    subscription_id,
+                    False,
+                    failure_code=
+                        "push_send_failed"
+                )
+
+            result["failed"] += 1
+
+            result[
+                "failed_subscription_ids"
+            ].append(
+                subscription_id
+            )
+
+    return result
+
+"""
+Return only safe subscription metadata for an
+administrator failure alert.
+"""  
+def get_admin_failure_subscription_info(
+    subscription_id
+):
+
+    if (
+        not isinstance(subscription_id, int)
+        or isinstance(subscription_id, bool)
+        or subscription_id < 1
+    ):
+
+        return None
+
+    try:
+
+        result = db_execute(
+            """
+            SELECT
+                subscription_id,
+                member_id,
+                platform,
+                device_label,
+                enabled,
+                failure_count,
+                last_error,
+                last_success_at
+
+            FROM push_subscriptions
+
+            WHERE subscription_id = ?
+            """,
+            (
+                subscription_id,
+            ),
+            fetch=True
+        )
+
+
+        if not result:
+
+            return None
+
+
+        row = result[0]
+
+
+        return {
+            "subscription_id":
+                row[0],
+
+            "member_id":
+                row[1],
+
+            "platform":
+                row[2] or "other",
+
+            "device_label":
+                row[3] or "Unknown",
+
+            "enabled":
+                row[4],
+
+            "failure_count":
+                row[5],
+
+            "last_error":
+                row[6] or "push_send_failed",
+
+            "last_success_at":
+                row[7]
+        }
+
+
+    except ValueError:
+
+        return None
+
+"""
+Convert a value to safe single-line text for the
+administrator alert email.
+"""
+def sanitize_admin_email_text(
+    value,
+    max_length=200
+):
+	
+    if value is None:
+
+        return "Unknown"
+
+    value = str(
+        value
+    )
+
+    value = (
+        value
+        .replace(
+            "\r",
+            " "
+        )
+        .replace(
+            "\n",
+            " "
+        )
+        .replace(
+            "\t",
+            " "
+        )
+        .strip()
+    )
+
+
+    if not value:
+
+        return "Unknown"
+
+
+    return value[
+        :max_length
+    ]
+
+"""
+Build one aggregated administrator email describing failed Web Push deliveries.
+"""
+def build_admin_failure_email(
+    delivery_summary,
+    alert_time=None
+):
+    if not isinstance(
+        delivery_summary,
+        dict
+    ):
+
+        raise ValueError(
+            "delivery_summary must be a dictionary"
+        )
+
+    failed_count = (
+        delivery_summary.get(
+            "failed",
+            0
+        )
+    )
+
+    failed_deliveries = (
+        delivery_summary.get(
+            "failed_deliveries",
+            []
+        )
+    )
+
+    if (
+        not isinstance(failed_count, int)
+        or isinstance(failed_count, bool)
+        or failed_count < 1
+    ):
+
+        raise ValueError(
+            "delivery_summary contains no failures"
+        )
+
+    if not isinstance(
+        failed_deliveries,
+        list
+    ):
+
+        raise ValueError(
+            "failed_deliveries must be a list"
+        )
+
+    if alert_time is None:
+
+        alert_time = datetime.now()
+
+    alert_time_text = (
+        alert_time.strftime(
+            "%m/%d/%Y at %I:%M %p"
+        )
+    )
+
+    subject = (
+        "PixelSentinel: "
+        "Web Push Delivery Failure"
+    )
+
+    lines = [
+        "PixelSentinel detected one or more "
+        "Web Push delivery failures.",
+        "",
+        f"Time: {alert_time_text}",
+        (
+            "Albums processed: "
+            f"{delivery_summary.get('albums_processed', 0)}"
+        ),
+        (
+            "Members processed: "
+            f"{delivery_summary.get('members_processed', 0)}"
+        ),
+        (
+            "Push attempts: "
+            f"{delivery_summary.get('attempted', 0)}"
+        ),
+        (
+            "Successful deliveries: "
+            f"{delivery_summary.get('sent', 0)}"
+        ),
+        (
+            "Failed deliveries this batch: "
+            f"{delivery_summary.get(
+            'batch_failed',
+            failed_count
+            )}"
+        ),
+        (
+            "New failure incidents in this alert: "
+            f"{failed_count}"
+        ),
+        "",
+        "Failure details:",
+        ""
+    ]
+
+    for failure in failed_deliveries:
+
+        if not isinstance(
+            failure,
+            dict
+        ):
+
+            continue
+
+        album_name = (
+            sanitize_admin_email_text(
+                failure.get(
+                    "album"
+                )
+            )
+        )
+
+        member_name = (
+            sanitize_admin_email_text(
+                failure.get(
+                    "member_name"
+                )
+            )
+        )
+
+        member_id = (
+            failure.get(
+                "member_id"
+            )
+        )
+
+        subscription_ids = (
+            failure.get(
+                "subscription_ids",
+                []
+            )
+        )
+
+        if not isinstance(
+            subscription_ids,
+            list
+        ):
+
+            continue
+
+
+        for subscription_id in subscription_ids:
+
+            info = (
+                get_admin_failure_subscription_info(
+                    subscription_id
+                )
+            )
+
+
+            lines.append(
+                f"Album: {album_name}"
+            )
+
+            lines.append(
+                f"Member: {member_name} "
+                f"(ID {member_id})"
+            )
+
+            lines.append(
+                f"Subscription ID: "
+                f"{subscription_id}"
+            )
+
+
+            if info is not None:
+
+                lines.append(
+                    "Device: "
+                    + sanitize_admin_email_text(
+                        info[
+                            "device_label"
+                        ]
+                    )
+                )
+
+                lines.append(
+                    "Platform: "
+                    + sanitize_admin_email_text(
+                        info[
+                            "platform"
+                        ]
+                    )
+                )
+
+                lines.append(
+                    "Failure count: "
+                    f"{info['failure_count']}"
+                )
+
+                lines.append(
+                    "Status: "
+                    + sanitize_admin_email_text(
+                        info[
+                            "last_error"
+                        ]
+                    )
+                )
+
+                lines.append(
+                    "Last successful delivery: "
+                    + sanitize_admin_email_text(
+                        info[
+                            "last_success_at"
+                        ]
+                    )
+                )
+
+            else:
+
+                lines.append(
+                    "Device information: "
+                    "Unavailable"
+                )
+
+
+            lines.append(
+                ""
+            )
+
+    body = "\n".join(
+        lines
+    )
+
+
+    message = MIMEMultipart()
+
+    message[
+        "From"
+    ] = SENDER_EMAIL
+
+    message[
+        "To"
+    ] = ADMIN_ALERT_EMAIL
+
+    message[
+        "Subject"
+    ] = subject
+
+
+    message.attach(
+        MIMEText(
+            body,
+            "plain"
+        )
+    )
+
+    return message
+
+"""
+Send one aggregated Web Push failure alert to the
+    configured PixelSentinel administrator.
+
+Returns True when Gmail accepts the message and
+    False when the administrator email cannot be sent.
+"""
+def send_admin_failure_email(
+    delivery_summary
+):
+
+    configuration_problems = (
+        validate_admin_email_configuration()
+    )
+
+    if configuration_problems:
+
+        print(
+            "Administrator email alert "
+            "configuration is invalid."
+        )
+
+        return False
+
+    try:
+
+        message = (
+            build_admin_failure_email(
+                delivery_summary
+            )
+        )
+
+
+        context = (
+            ssl.create_default_context()
+        )
+
+
+        with smtplib.SMTP_SSL(
+            SMTP_SERVER,
+            int(
+                SMTP_PORT
+            ),
+            context=context
+        ) as smtp:
+
+            smtp.login(
+                SMTP_USER,
+                SMTP_APP_PASSWORD
+            )
+
+
+            smtp.send_message(
+                message
+            )
+
+
+        print(
+            "Administrator Web Push failure "
+            "alert sent successfully."
+        )
+
+
+        return True
+
+
+    except (
+        smtplib.SMTPException,
+        OSError,
+        ValueError
+    ):
+
+        print(
+            "Administrator Web Push failure "
+            "alert could not be sent."
+        )
+
+
+        return False
+
+"""
+    Handle administrator notification for failed Web Push
+    deliveries without repeatedly emailing for the same
+    ongoing device failure.
+
+    Returns:
+        None  - no administrator email was needed
+        True  - administrator email sent and recorded
+        False - administrator alert handling failed
+"""
+def handle_admin_failure_alert(
+    delivery_summary
+):
+    if not isinstance(
+        delivery_summary,
+        dict
+    ):
+        raise ValueError(
+            "delivery_summary must be a dictionary"
+        )
+
+    failed_count = (
+        delivery_summary.get(
+            "failed",
+            0
+        )
+    )
+
+    if (
+        not isinstance(
+            failed_count,
+            int
+        )
+        or isinstance(
+            failed_count,
+            bool
+        )
+        or failed_count < 0
+    ):
+        raise ValueError(
+            "delivery_summary contains an "
+            "invalid failure count"
+        )
+
+    if failed_count == 0:
+
+        return None
+
+    subscription_ids = (
+        get_unalerted_failed_subscription_ids(
+            delivery_summary
+        )
+    )
+
+    # All failed subscriptions have already generated
+    # an administrator alert for their current incident.
+    if not subscription_ids:
+
+        return None
+
+    alert_summary = (
+        build_admin_alert_summary(
+            delivery_summary,
+            subscription_ids
+        )
+    )
+
+    email_sent = (
+        send_admin_failure_email(
+            alert_summary
+        )
+    )
+
+    if not email_sent:
+
+        # Do not mark the subscriptions. This allows a
+        # later failed batch to retry the administrator
+        # email.
+        return False
+
+    recorded = (
+        mark_admin_failure_alert_sent(
+            subscription_ids
+        )
+    )
+
+    if not recorded:
+
+        print(
+            "Administrator alert was sent, "
+            "but alert tracking could not "
+            "be recorded."
+        )
+        return False
+
+    return True
+
+"""
+Return failed subscription IDs that have not yet
+    generated an administrator alert for their current
+    failure incident.
+"""
+def get_unalerted_failed_subscription_ids(
+    delivery_summary
+):
+
+    if not isinstance(
+        delivery_summary,
+        dict
+    ):
+        
+        raise ValueError(
+            "delivery_summary must be a dictionary"
+        )
+
+    failed_deliveries = (
+        delivery_summary.get(
+            "failed_deliveries",
+            []
+        )
+    )
+
+    if not isinstance(
+        failed_deliveries,
+        list
+    ):
+
+        raise ValueError(
+            "failed_deliveries must be a list"
+        )
+
+    subscription_ids = set()
+
+    for failure in failed_deliveries:
+
+        if not isinstance(
+            failure,
+            dict
+        ):
+            continue
+
+        ids = failure.get(
+            "subscription_ids",
+            []
+        )
+
+        if not isinstance(
+            ids,
+            list
+        ):
+
+            continue
+
+        for subscription_id in ids:
+
+            if (
+                isinstance(
+                    subscription_id,
+                    int
+                )
+                and not isinstance(
+                    subscription_id,
+                    bool
+                )
+                and subscription_id > 0
+            ):
+
+                subscription_ids.add(
+                    subscription_id
+                )
+
+    if not subscription_ids:
+
+        return []
+
+    ordered_ids = sorted(
+        subscription_ids
+    )
+
+    placeholders = ",".join(
+        "?"
+        for _ in ordered_ids
+    )
+
+    try:
+
+        rows = db_execute(
+            f"""
+            SELECT subscription_id
+
+            FROM push_subscriptions
+
+            WHERE subscription_id
+                IN ({placeholders})
+
+              AND failure_count > 0
+
+              AND admin_alert_sent_at
+                  IS NULL
+
+            ORDER BY subscription_id
+            """,
+            tuple(
+                ordered_ids
+            ),
+            fetch=True
+        )
+
+        return [
+            row[0]
+            for row in rows
+        ]
+
+    except ValueError:
+
+        return []
+
+"""
+Filter a failed-delivery summary so the administrator
+    email contains only failure incidents that have not
+    already generated an alert.
+"""
+def build_admin_alert_summary(
+    delivery_summary,
+    subscription_ids
+):
+    allowed_ids = set(
+        subscription_ids
+    )
+
+    filtered_failures = []
+
+    for failure in delivery_summary.get(
+        "failed_deliveries",
+        []
+    ):
+
+        if not isinstance(
+            failure,
+            dict
+        ):
+
+            continue
+
+        matching_ids = [
+            subscription_id
+
+            for subscription_id
+            in failure.get(
+                "subscription_ids",
+                []
+            )
+
+            if subscription_id
+            in allowed_ids
+        ]
+
+        if not matching_ids:
+
+            continue
+
+        filtered_failure = dict(
+            failure
+        )
+
+        filtered_failure[
+            "subscription_ids"
+        ] = matching_ids
+
+        filtered_failures.append(
+            filtered_failure
+        )
+
+    alert_summary = dict(
+        delivery_summary
+    )
+
+    # Preserve how many failures actually happened
+    # in the complete Web Push batch.
+    alert_summary[
+        "batch_failed"
+    ] = delivery_summary.get(
+        "failed",
+        0
+    )
+
+    # "failed" now represents only failures that
+    # are included in this administrator email.
+    alert_summary[
+        "failed"
+    ] = len(
+        subscription_ids
+    )
+
+    alert_summary[
+        "failed_deliveries"
+    ] = filtered_failures
+
+
+    return alert_summary
+
+"""
+Mark failure incidents as administrator-alerted.
+
+    This is called only after the administrator email
+    has been successfully accepted by SMTP.
+"""
+def mark_admin_failure_alert_sent(
+    subscription_ids
+):
+    if not isinstance(
+        subscription_ids,
+        list
+    ):
+        return False
+
+    subscription_ids = sorted({
+        subscription_id
+
+        for subscription_id
+        in subscription_ids
+
+        if (
+            isinstance(
+                subscription_id,
+                int
+            )
+            and not isinstance(
+                subscription_id,
+                bool
+            )
+            and subscription_id > 0
+        )
+    })
+
+    if not subscription_ids:
+
+        return False
+
+    placeholders = ",".join(
+        "?"
+        for _ in subscription_ids
+    )
+
+    connection = None
+
+    try:
+
+        connection = sqlite3.connect(
+            db_file,
+            timeout=5
+        )
+
+        connection.execute(
+            "PRAGMA foreign_keys = ON"
+        )
+
+        connection.execute(
+            "PRAGMA busy_timeout = 5000"
+        )
+
+        connection.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+
+        cursor = connection.execute(
+            f"""
+            UPDATE push_subscriptions
+
+            SET
+                admin_alert_sent_at =
+                    CURRENT_TIMESTAMP,
+
+                updated_at =
+                    CURRENT_TIMESTAMP
+
+            WHERE subscription_id
+                IN ({placeholders})
+
+              AND failure_count > 0
+
+              AND admin_alert_sent_at
+                  IS NULL
+            """,
+            tuple(
+                subscription_ids
+            )
+        )
+
+        if cursor.rowcount != len(
+            subscription_ids
+        ):
+
+            connection.rollback()
+
+            return False
+
+        connection.commit()
+
+        return True
+
+    except sqlite3.Error:
+
+        if connection is not None:
+
+            connection.rollback()
+
+        return False
+
+    finally:
+
+        if connection is not None:
+
+            connection.close()
+
+"""
+Build and send Web Push photo alerts for each album.
+
+    photo_counts is expected to contain:
+
+        {
+            "Album Name": number_of_new_photos
+        }
+
+    Returns a safe batch summary.
+"""
+def send_new_photo_alerts(
+    photo_counts,
+    send_time=None
+):
+    if not isinstance(
+        photo_counts,
+        dict
+    ):
+
+        raise ValueError(
+            "photo_counts must be a dictionary"
+        )
+
+    if send_time is None:
+
+        send_time = datetime.now()
+
+    summary = {
+        "albums_processed":
+            0,
+
+        "members_processed":
+            0,
+
+        "members_without_devices":
+            0,
+
+        "attempted":
+            0,
+
+        "sent":
+            0,
+
+        "failed":
+            0,
+
+        "failed_deliveries":
+            []
+    }
+
+    for album_name, photo_count in (
+        photo_counts.items()
+    ):
+
+        if (
+            not isinstance(album_name, str)
+            or not album_name.strip()
+        ):
+
+            raise ValueError(
+                "album name must be a "
+                "non-empty string"
+            )
+
+        if (
+            not isinstance(photo_count, int)
+            or isinstance(photo_count, bool)
+            or photo_count < 1
+        ):
+
+            raise ValueError(
+                "photo count must be a "
+                "positive integer"
+            )
+
+        members = get_album_members(
+            album_name
+        )
+
+        summary[
+            "albums_processed"
+        ] += 1
+
+        for (
+            member_id,
+            member_name
+        ) in members:
+
+            summary[
+                "members_processed"
+            ] += 1
+
+            payload = build_web_push(
+                member_name,
+                album_name,
+                photo_count,
+                send_time
+            )
+
+            result = (
+                send_member_web_push(
+                    member_id,
+                    payload
+                )
+            )
+
+            summary[
+                "attempted"
+            ] += result[
+                "attempted"
+            ]
+
+            summary[
+                "sent"
+            ] += result[
+                "sent"
+            ]
+
+            summary[
+                "failed"
+            ] += result[
+                "failed"
+            ]
+
+            if result[
+                "attempted"
+            ] == 0:
+
+                summary[
+                    "members_without_devices"
+                ] += 1
+
+            if result[
+                "failed"
+            ] > 0:
+
+                summary[
+                    "failed_deliveries"
+                ].append(
+                    {
+                        "album":
+                            album_name,
+
+                        "member_id":
+                            member_id,
+
+                        "member_name":
+                            member_name,
+
+                        "subscription_ids":
+                            result[
+                                "failed_subscription_ids"
+                            ]
+                    }
+                )
+
+    return summary
 
 def main():
     # Start the timer
@@ -512,14 +1976,43 @@ def main():
 
     # Handle new files
     if files_new:
-        # New files already added to database via process_file_with_db in get_file_list
-        new_photo_count = get_album_photo_counts(files_new)
-
-        # Send alerts
-       # sendalerts(new_photo_count)
+        # New files were already added to the database by process_file in get_file_list.
+        new_photo_counts = (
+            get_album_photo_counts(
+                files_new
+            )
+        )
 
         for file in files_new:
-            print(f"New File: {file['path']} (Checksum: {file['checksum']})")
+
+            print(
+                f"New File: {file['path']} "
+                f"(Checksum: {file['checksum']})"
+            )
+
+        delivery_summary = (
+            send_new_photo_alerts(
+                new_photo_counts
+            )
+        )
+
+        print(
+            "Web Push delivery summary: "
+            f"Albums="
+            f"{delivery_summary['albums_processed']}, "
+            f"Members="
+            f"{delivery_summary['members_processed']}, "
+            f"Attempts="
+            f"{delivery_summary['attempted']}, "
+            f"Sent="
+            f"{delivery_summary['sent']}, "
+            f"Failed="
+            f"{delivery_summary['failed']}, "
+            f"No devices="
+            f"{delivery_summary['members_without_devices']}"
+        )
+        
+        admin_alert_result = (handle_admin_failure_alert(delivery_summary))
 
     # Handle moved files
     if files_moved:
