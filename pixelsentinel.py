@@ -431,11 +431,40 @@ def process_file(full_path, relative_path, modified_time):
         return {"path": relative_path, "checksum": checksum, "timestamp": modified_time}
 
     except FileNotFoundError:
-        print(f"Error: File not found - {full_path}")
-    except sqlite3.DatabaseError as e:
-        print(f"Database error while processing {full_path}: {e}")
-    except Exception as e:
-        print(f"Unexpected error while processing {full_path}: {e}")
+
+        scanner_debug_logger.exception(
+            "Photo file not found | Path: %r",
+            full_path
+        )
+
+        print(
+            "File processing warning: "
+            "a photo file was not found."
+        )
+
+    except sqlite3.DatabaseError:
+
+        scanner_debug_logger.exception(
+            "Database error while processing photo | Path: %r",
+            full_path
+        )
+
+        print(
+            "File processing database error. "
+            "Details recorded privately."
+        )
+
+    except Exception:
+
+        scanner_debug_logger.exception(
+            "Unexpected photo processing error | Path: %r",
+            full_path
+        )
+
+        print(
+            "File processing error. "
+            "Details recorded privately."
+        )
 
 def get_file_list():
     file_tasks = []
