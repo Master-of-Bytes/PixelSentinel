@@ -45,18 +45,49 @@ REMOVAL_PUSH_TTL_SECONDS = 900
 REMOVAL_ACK_WAIT_SECONDS = 15
 
 def db_execute(query, params=(), fetch=False):
+
     connection = sqlite3.connect(db_file)
-    connection.execute("PRAGMA foreign_keys = ON")
+
+    connection.execute(
+        "PRAGMA foreign_keys = ON"
+    )
+
     cursor = connection.cursor()
+
     try:
-        cursor.execute(query, params)
+
+        cursor.execute(
+            query,
+            params
+        )
+
         if fetch:
             return cursor.fetchall()
+
         connection.commit()
-    except sqlite3.Error as e:
-        connection.rollback()  # Rollback in case of error
-        raise ValueError(f"An error occurred while executing the query: {query} : error: {e}")
+
+    except sqlite3.Error as error:
+
+        connection.rollback()
+
+        # Keep a useful SQLite error identifier,
+        # but never expose the complete SQL query,
+        # parameters, or underlying exception.
+        error_code = (
+            getattr(
+                error,
+                "sqlite_errorname",
+                None
+            )
+            or type(error).__name__
+        )
+
+        raise ValueError(
+            f"Database operation failed ({error_code})."
+        ) from None
+
     finally:
+
         cursor.close()
         connection.close()
 
@@ -1018,7 +1049,28 @@ def format_save_report(total_files,groups,membership,albums):
         </body>
         </html>
         """
-    with open("PixelSentinelReport.html", "w", encoding="utf-8") as file:
+    # Save the report in the PixelSentinel directory,
+    # regardless of the current working directory.
+    report_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "PixelSentinelReport.html"
+    )
+
+    # Use owner-only permissions and prevent writing
+    # through a symbolic link.
+    fd = os.open(
+        report_path,
+        os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW,
+        0o600
+    )
+
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        os.fchmod(
+            file.fileno(),
+            0o600
+        )
+
+        file.truncate(0)
         file.write(html_content)
 
 # Creates a report

@@ -22,6 +22,7 @@ from flask import Flask, render_template, abort, jsonify, make_response, send_fr
 from dotenv import load_dotenv
 from pywebpush import webpush, WebPushException
 from urllib.parse import urlparse
+from werkzeug.exceptions import HTTPException
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -927,9 +928,14 @@ def send_web_push(
 
         raise PushDeliveryError() from error
 
-    except Exception as error:
+    except Exception:
 
-        logger.exception(
+        # Do not log provider exception details or
+        # tracebacks.
+        # Keep only a safe endpoint fingerprint
+        # for operational correlation.
+
+        logger.error(
             "Unexpected Web Push delivery failure. "
             "Endpoint fingerprint: %s",
             get_endpoint_fingerprint(
@@ -937,7 +943,7 @@ def send_web_push(
             ),
         )
 
-        raise PushDeliveryError() from error
+        raise PushDeliveryError() from None
 
 def is_valid_request_origin():
     """
@@ -1673,6 +1679,31 @@ def enrollment_manifest(token):
     response.headers["Cache-Control"] = "no-store"
 
     return response
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    """
+    Prevent unexpected application exceptions
+    from exposing private request paths, tokens,
+    or exception details in Gunicorn logs.
+    """
+
+    # Preserve normal HTTP errors, including
+    # 403, 404, 405 and 413 responses.
+    if isinstance(error, HTTPException):
+        return error
+
+    # Log only a generic operational message.
+    # Do not include request.path, request.url,
+    # the exception message, or traceback.
+    logger.error(
+        "Unhandled PixelSentinel web request failure."
+    )
+
+    return jsonify({
+        "ok": False,
+        "error": "internal_error"
+    }), 500
 
 @app.errorhandler(404)
 def not_found(error):

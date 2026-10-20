@@ -19,6 +19,8 @@ import hashlib
 import smtplib
 import subprocess
 import ssl
+import logging
+from logging.handlers import RotatingFileHandler
 from collections import defaultdict
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -68,6 +70,66 @@ SENDER_EMAIL = os.getenv(
     ""
 ).strip()
 
+# ==================================================
+# Private scanner debug logging
+# ==================================================
+
+LOG_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "logs"
+)
+
+SCANNER_DEBUG_LOG = os.path.join(
+    LOG_DIR,
+    "pixelsentinel_scanner_debug.log"
+)
+
+
+def configure_scanner_debug_logger():
+
+    # Ensure new runtime files are owner-only.
+    os.umask(0o077)
+
+    os.makedirs(
+        LOG_DIR,
+        mode=0o700,
+        exist_ok=True
+    )
+
+    os.chmod(LOG_DIR, 0o700)
+
+    logger = logging.getLogger(
+        "pixelsentinel.scanner.debug"
+    )
+
+    logger.setLevel(logging.INFO)
+
+    # Prevent debug records from reaching console
+    # or DSM Task Scheduler output.
+    logger.propagate = False
+
+    if not logger.handlers:
+
+        handler = RotatingFileHandler(
+            SCANNER_DEBUG_LOG,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8"
+        )
+
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(levelname)s | %(message)s"
+            )
+        )
+
+        logger.addHandler(handler)
+
+    os.chmod(SCANNER_DEBUG_LOG, 0o600)
+
+    return logger
+
+scanner_debug_logger = configure_scanner_debug_logger()
 
 # Validate the administrator-only SMTP configuration.
 
@@ -1983,12 +2045,18 @@ def main():
             )
         )
 
+        # Log detailed photo information privately.
         for file in files_new:
-
-            print(
-                f"New File: {file['path']} "
-                f"(Checksum: {file['checksum']})"
+            scanner_debug_logger.info(
+                "New photo | Path: %s | SHA256: %s",
+                file["path"],
+                file["checksum"]
             )
+
+        # Only report counts to DSM.
+        print(
+            f"New photos detected: {len(files_new)}"
+        )
 
         delivery_summary = (
             send_new_photo_alerts(
@@ -2014,15 +2082,31 @@ def main():
         
         admin_alert_result = (handle_admin_failure_alert(delivery_summary))
 
-    # Handle moved files
+    # Handle moved files.
     if files_moved:
-        print(f"{len(files_moved)} file(s) moved.")
-        print(f"Files Moved: {files_moved}")
 
-    # Handle deleted files
+        print(
+            f"Files moved: {len(files_moved)}"
+        )
+
+        for file in files_moved:
+            scanner_debug_logger.info(
+                "File moved | Details: %r",
+                file
+            )
+
+    # Handle deleted files.
     if files_deleted:
-        print(f"{len(files_deleted)} file(s) removed.")
-        print(f"Files Removed: {files_deleted}")
+
+        print(
+            f"Files removed: {len(files_deleted)}"
+        )
+
+        for file in files_deleted:
+            scanner_debug_logger.info(
+                "File removed | Details: %r",
+                file
+            )
 
     # Stop the timer
     end_time = time.time()
