@@ -61,3 +61,35 @@ You can update the start time to whatever time you would like.
 ## Task Settings:
 
 ![image](https://github.com/user-attachments/assets/5b1c9fb8-dd24-4255-bfa8-f3758be522fc)
+
+## Troubleshooting: DSM Task Scheduler failure emails not arriving
+
+PixelSentinel's `.env` SMTP settings are for **application-generated administrator alerts**. **Synology DSM Task Scheduler** uses **DSM's own email sender configuration** for task run-detail emails. A working PixelSentinel SMTP configuration does not automatically configure DSM notifications.
+
+If **Send Test Email** works but a Task Scheduler task does not send its run details, check the following:
+
+1. Open **DSM → Control Panel → Notification → Email → Sender → Set Up**.
+2. For Gmail, configure the sender (using a dedicated sending account if desired):
+   - **Service provider:** `Custom SMTP server`
+   - **SMTP server:** `smtp.gmail.com`
+   - **SMTP port:** `587` (SMTP with TLS; port `465` with SSL/TLS is another supported setup)
+   - **Authentication required:** enabled
+   - **Username:** the Gmail sending address
+   - **Password:** a Google **app password** (enable Google 2-Step Verification as required)
+   - **Secure connection (SSL/TLS) required:** enabled
+   - **Verify the SSL/TLS certificate:** enabled
+   - **Sender name:** e.g., `PixelSentinel DSM`
+   - **Sender email:** the same Gmail sending address
+3. Save the sender configuration. Back on **Notification → Email**, make sure **Sender email** displays the configured address rather than `-`.
+4. Edit the appropriate DSM task under **Control Panel → Task Scheduler → Task Settings**. Enable **Send run details by email**, enter the **intended recipient address**, and optionally select **Send run details only when the script terminates abnormally**.
+5. Test the recipient using a temporary user-defined DSM task, with **failure-only emails** enabled and the following harmless script:
+
+   ```sh
+   #!/bin/sh
+   echo "ERROR: PixelSentinel controlled DSM notification test."
+   exit 1
+   ```
+
+   Run it manually. A nonzero exit code is intentional; confirm the expected email arrives at the **task's recipient address**, then remove the temporary test task.
+
+**Privacy:** Keep DSM Task Scheduler's global **Save output results** disabled if you do not need it; it can store script output in a separate folder. Do not print credentials, enrollment URLs, push tokens, photo paths, or tracebacks in task output or failure emails. For production tasks, capture detailed diagnostics in private logs and emit only generic errors to DSM. Never put an SMTP password or app password in the README or scheduled-task command.
